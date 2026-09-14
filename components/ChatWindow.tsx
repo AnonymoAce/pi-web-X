@@ -1314,7 +1314,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
       )}
 
       <div className="relative shrink-0">
-        {!isEmptyNew && showScrollToBottom && !pendingScrollRestore && (
+        {!isEmptyNew && (
           <div
             style={{
               position: "absolute",
@@ -1330,7 +1330,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
           >
             <button
               type="button"
-              className="chat-scroll-to-bottom"
+              className={`chat-scroll-to-bottom${showScrollToBottom && !pendingScrollRestore ? " is-visible" : ""}`}
               title={t("chat.scrollToLatest")}
               aria-label={t("chat.scrollToLatest")}
               onClick={() => scrollToBottom("smooth")}
