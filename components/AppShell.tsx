@@ -34,6 +34,7 @@ import {
 } from "@/lib/browser-notifications";
 import { setupPushSubscription } from "@/lib/push-client";
 import { getInitialNavigation } from "@/lib/initial-navigation";
+import { getTabOpenSession, setTabOpenSession } from "@/lib/tab-session";
 import { rekeyDraft } from "@/lib/draft-store";
 import {
   clearLastOpen,
@@ -78,7 +79,7 @@ function parkedNewSessionDraftKey(cwd: string): string {
 export function AppShell() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const [initialNavigation] = useState(() => getInitialNavigation(searchParams));
+  const [initialNavigation] = useState(() => getInitialNavigation(searchParams, getTabOpenSession()));
   // Keep the system-theme subscription mounted for the lifetime of the app.
   useTheme();
   const { locale, t: translate } = useI18n();
@@ -513,12 +514,15 @@ export function AppShell() {
   // Persist every active-session transition, including new and forked sessions
   // that bypass the sidebar selection handler. Transient sessions do not yet
   // carry projectKey, so use the active project identity until hydration.
+  // The workspace memory is shared by every tab; the tab memory keeps this
+  // tab's own session so a reload does not follow another tab's last pick.
   useEffect(() => {
     if (!selectedSession) return;
     const projectKey = selectedSession.projectKey
       ?? activeProjectKeyRef.current
       ?? workspaceKeyOf(selectedSession);
     setLastOpenSession(projectKey, selectedSession.id);
+    setTabOpenSession(selectedSession.id);
   }, [selectedSession]);
 
   useEffect(() => {
