@@ -42,14 +42,28 @@ test("floats the scroll-to-latest button above the composer, clear of the minima
   assert.match(block, /onClick=\{\(\) => scrollToBottom\("smooth"\)\}/);
 });
 
-test("fades the button in and out without motion when motion is reduced", () => {
+test("keeps the visible button faint until hover or focus", () => {
   const hidden = cssSource.slice(cssSource.indexOf(".chat-scroll-to-bottom {"));
   const visible = hidden.slice(hidden.indexOf(".chat-scroll-to-bottom.is-visible {"));
+  const reveal = hidden.slice(hidden.indexOf(".chat-scroll-to-bottom.is-visible:hover"));
+
+  assert.match(visible.slice(0, visible.indexOf("}")), /opacity: 0\.28;[\s\S]*?visibility: visible;[\s\S]*?transform: none;/);
+  assert.match(reveal.slice(0, reveal.indexOf("}")), /opacity: 1;/);
+  assert.match(
+    cssSource,
+    /\.chat-scroll-to-bottom\.is-visible:hover,\s*\.chat-scroll-to-bottom\.is-visible:focus-visible \{[\s\S]*?opacity: 1;/,
+  );
+});
+
+test("fades the button in and out without motion when motion is reduced", () => {
+  const hidden = cssSource.slice(cssSource.indexOf(".chat-scroll-to-bottom {"));
 
   assert.match(hidden.slice(0, hidden.indexOf("}")), /opacity: 0;[\s\S]*?visibility: hidden;[\s\S]*?transform: translateY\(4px\) scale\(0\.96\);/);
   assert.match(hidden.slice(0, hidden.indexOf("}")), /transition:[\s\S]*?opacity 0\.16s ease,[\s\S]*?transform 0\.16s ease,[\s\S]*?visibility 0s linear 0\.16s;/);
-  assert.match(visible.slice(0, visible.indexOf("}")), /opacity: 1;[\s\S]*?visibility: visible;[\s\S]*?transform: none;/);
-  assert.match(cssSource, /@media \(prefers-reduced-motion: reduce\) \{\s*\.chat-scroll-to-bottom,\s*\.chat-scroll-to-bottom\.is-visible \{\s*transform: none;\s*transition: background 0\.12s, color 0\.12s;/);
+  assert.match(
+    cssSource,
+    /@media \(prefers-reduced-motion: reduce\) \{\s*\.chat-scroll-to-bottom,\s*\.chat-scroll-to-bottom\.is-visible \{\s*transform: none;\s*transition:\s*opacity 0\.16s ease,/,
+  );
 });
 
 test("jumps to the live tail with the shared smooth scroll helper", () => {

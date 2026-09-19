@@ -1336,7 +1336,7 @@ pre, code {
 }
 
 .chat-scroll-to-bottom.is-visible {
-  opacity: 1;
+  opacity: 0.28;
   visibility: visible;
   pointer-events: auto;
   transform: none;
@@ -1348,7 +1348,9 @@ pre, code {
     visibility 0s;
 }
 
-.chat-scroll-to-bottom:hover {
+.chat-scroll-to-bottom.is-visible:hover,
+.chat-scroll-to-bottom.is-visible:focus-visible {
+  opacity: 1;
   background: var(--bg-hover);
   color: var(--text);
 }
@@ -1362,7 +1364,19 @@ pre, code {
   .chat-scroll-to-bottom,
   .chat-scroll-to-bottom.is-visible {
     transform: none;
-    transition: background 0.12s, color 0.12s;
+    transition:
+      opacity 0.16s ease,
+      background 0.12s,
+      color 0.12s,
+      visibility 0s linear 0.16s;
+  }
+
+  .chat-scroll-to-bottom.is-visible {
+    transition:
+      opacity 0.16s ease,
+      background 0.12s,
+      color 0.12s,
+      visibility 0s;
   }
 }
 
