@@ -15,7 +15,7 @@ const { buildSessionChangeTree, buildSessionChanges } = await jiti.import("@/lib
 
 const source = await readFile(new URL("./SessionChangesPanel.tsx", import.meta.url), "utf8");
 
-const CWD = "E:\\pi-web-X";
+const CWD = "C:\\work\\repo";
 
 function entriesFor(paths) {
   const summary = buildSessionChanges(
@@ -23,8 +23,8 @@ function entriesFor(paths) {
     {
       isGitRepository: true,
       files: [
-        { filePath: "E:\\pi-web-X\\lib\\turn-written-files.ts", status: "modified", code: "M", indexStatus: " ", worktreeStatus: "M" },
-        { filePath: "E:\\pi-web-X\\components\\SessionChangesPanel.tsx", status: "untracked", code: "?", indexStatus: "?", worktreeStatus: "?" },
+        { filePath: "C:\\work\\repo\\lib\\turn-written-files.ts", status: "modified", code: "M", indexStatus: " ", worktreeStatus: "M" },
+        { filePath: "C:\\work\\repo\\components\\SessionChangesPanel.tsx", status: "untracked", code: "?", indexStatus: "?", worktreeStatus: "?" },
       ],
     },
     CWD,
@@ -43,8 +43,8 @@ test("component source declares no Tailwind className and no react-i18next", () 
 
 test("renders the written file paths and their git status labels", () => {
   const entries = entriesFor([
-    "E:\\pi-web-X\\lib\\turn-written-files.ts",
-    "E:\\pi-web-X\\components\\SessionChangesPanel.tsx",
+    "C:\\work\\repo\\lib\\turn-written-files.ts",
+    "C:\\work\\repo\\components\\SessionChangesPanel.tsx",
   ]);
   const html = render(
     React.createElement(SessionChangeTree, {
@@ -55,8 +55,8 @@ test("renders the written file paths and their git status labels", () => {
     }),
   );
 
-  assert.match(html, /data-session-change-file="E:\\pi-web-X\\lib\\turn-written-files\.ts"/);
-  assert.match(html, /data-session-change-file="E:\\pi-web-X\\components\\SessionChangesPanel\.tsx"/);
+  assert.match(html, /data-session-change-file="C:\\work\\repo\\lib\\turn-written-files\.ts"/);
+  assert.match(html, /data-session-change-file="C:\\work\\repo\\components\\SessionChangesPanel\.tsx"/);
   assert.match(html, /data-session-change-status="modified"/);
   assert.match(html, /data-session-change-status="untracked"/);
   assert.match(html, /turn-written-files\.ts<\/span>/);
@@ -79,7 +79,7 @@ test("status label falls back to Chinese when the i18n key is missing", () => {
 test("status label uses the i18n value when present", () => {
   const html = render(
     React.createElement(SessionChangeTree, {
-      nodes: buildSessionChangeTree(entriesFor(["E:\\pi-web-X\\lib\\turn-written-files.ts"])),
+      nodes: buildSessionChangeTree(entriesFor(["C:\\work\\repo\\lib\\turn-written-files.ts"])),
       activePath: null,
       onSelect: () => {},
       translate: () => "已修改",
