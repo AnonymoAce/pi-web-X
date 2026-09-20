@@ -1,0 +1,265 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useI18n } from "@/hooks/useI18n";
+import type { EnabledModelsView } from "@/lib/enabled-models";
+import {
+  enabledModelsBulkActions,
+  filterEnabledModels,
+  findProviderView,
+  isLastEnabledModel,
+} from "./enabled-models-helpers";
+import { ConfigButton, ConfigSectionTitle, ConfigSwitch } from "./SettingsUi";
+
+/**
+ * Model switches backed by pi's `enabledModels` setting.
+ *
+ * Every switch writes through `/api/models/enabled` right away, like the login
+ * controls in the same panel and unlike the models.json editor around them,
+ * which buffers until Save. Requests are serialized: each one is a
+ * read-modify-write of one settings key, so overlapping edits from the same
+ * panel could otherwise lose one of them.
+ */
+
+interface Failure {
+  /** Translation key for a known refusal. */
+  messageKey?: string;
+  /** Raw server text for everything else. */
+  message?: string;
+}
+
+export interface EnabledModelsController {
+  view: EnabledModelsView | null;
+  loading: boolean;
+  /** Control currently waiting on the server, or null when idle. */
+  pending: string | null;
+  failure: Failure | null;
+  setModels: (key: string, refs: string[], enabled: boolean) => void;
+  setProvider: (providerId: string, enabled: boolean) => void;
+  clearScope: () => void;
+}
+
+type MutationBody =
+  | { op: "models"; refs: string[]; enabled: boolean }
+  | { op: "provider"; provider: string; enabled: boolean }
+  | { op: "clear" };
+
+const FAILURE_KEYS: Record<string, string> = {
+  "last-model": "models.enabledLastModel",
+  "project-scope": "models.enabledProjectScope",
+};
+
+export function useEnabledModels(cwd?: string | null): EnabledModelsController {
+  const [view, setView] = useState<EnabledModelsView | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [pending, setPending] = useState<string | null>(null);
+  const [failure, setFailure] = useState<Failure | null>(null);
+  const pendingRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setLoading(true);
+    const query = cwd ? `?cwd=${encodeURIComponent(cwd)}` : "";
+    fetch(`/api/models/enabled${query}`, { signal: controller.signal })
+      .then(async (res) => {
+        const data = await res.json() as EnabledModelsView & { error?: string };
+        if (!res.ok || data.error) throw new Error(data.error ?? `HTTP ${res.status}`);
+        setView(data);
+        setFailure(null);
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        setFailure({ message: error instanceof Error ? error.message : String(error) });
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+    return () => controller.abort();
+  }, [cwd]);
+
+  const mutate = useCallback((key: string, body: MutationBody) => {
+    if (pendingRef.current) return;
+    pendingRef.current = key;
+    setPending(key);
+    setFailure(null);
+    void (async () => {
+      try {
+        const res = await fetch("/api/models/enabled", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...body, ...(cwd ? { cwd } : {}) }),
+        });
+        const data = await res.json() as EnabledModelsView & { error?: string; reason?: string };
+        if (!res.ok || data.error) {
+          const messageKey = data.reason ? FAILURE_KEYS[data.reason] : undefined;
+          setFailure(messageKey ? { messageKey } : { message: data.error ?? `HTTP ${res.status}` });
+          return;
+        }
+        setView(data);
+      } catch (error) {
+        setFailure({ message: error instanceof Error ? error.message : String(error) });
+      } finally {
+        pendingRef.current = null;
+        setPending(null);
+      }
+    })();
+  }, [cwd]);
+
+  const setModels = useCallback((key: string, refs: string[], enabled: boolean) => {
+    mutate(key, { op: "models", refs, enabled });
+  }, [mutate]);
+
+  const setProvider = useCallback((providerId: string, enabled: boolean) => {
+    mutate(`provider:${providerId}`, { op: "provider", provider: providerId, enabled });
+  }, [mutate]);
+
+  const clearScope = useCallback(() => mutate("clear", { op: "clear" }), [mutate]);
+
+  return { view, loading, pending, failure, setModels, setProvider, clearScope };
+}
+
+/** Panel-wide note shown while `enabledModels` narrows the selector. */
+export function EnabledModelsBanner({ controller }: { controller: EnabledModelsController }) {
+  const { t } = useI18n();
+  const { view, pending } = controller;
+  if (!view) return null;
+  const scoped = !view.allEnabled;
+  const stale = view.stalePatterns.length;
+  if (!scoped && stale === 0) return null;
+
+  return (
+    <div className="enabled-models-banner">
+      <span className="enabled-models-banner-text">
+        {scoped
+          ? t("models.enabledBanner", { enabled: view.enabledTotal, total: view.availableTotal })
+          : t("models.enabledStale", { count: stale })}
+        {scoped && stale > 0 && ` · ${t("models.enabledStale", { count: stale })}`}
+      </span>
+      {view.editable && scoped && (
+        <ConfigButton
+          size="small"
+          onClick={controller.clearScope}
+          disabled={pending !== null}
+          title={t("models.enabledClearHint")}
+        >
+          {t("models.enabledClear")}
+        </ConfigButton>
+      )}
+    </div>
+  );
+}
+
+export function EnabledModelsSection({
+  providerId,
+  controller,
+}: {
+  providerId: string;
+  controller: EnabledModelsController;
+}) {
+  const { t } = useI18n();
+  const [query, setQuery] = useState("");
+  const { view, loading, pending, failure } = controller;
+  const provider = findProviderView(view, providerId);
+
+  useEffect(() => setQuery(""), [providerId]);
+
+  if (loading && !view) {
+    return <div className="enabled-models-empty">{t("agents.modelsLoading")}</div>;
+  }
+  if (!provider) {
+    return failure?.message
+      ? <div className="enabled-models-error">{failure.message}</div>
+      : <div className="enabled-models-empty">{t("models.enabledUnavailable")}</div>;
+  }
+
+  const custom = provider.kind === "custom";
+  const shown = custom ? provider.models : filterEnabledModels(provider.models, query);
+  const bulk = enabledModelsBulkActions(view, shown);
+  const filtered = !custom && shown.length !== provider.models.length;
+  const busy = pending !== null;
+  const bulkKey = `provider:${provider.id}`;
+  // A provider-wide action is resolved server-side so models the browser has
+  // not seen yet follow it too; a filtered action names its rows explicitly.
+  const runBulk = (enabled: boolean, refs: string[]) => {
+    if (filtered) controller.setModels(bulkKey, refs, enabled);
+    else controller.setProvider(provider.id, enabled);
+  };
+
+  return (
+    <div className="enabled-models-section">
+      <div className="enabled-models-header">
+        <ConfigSectionTitle>{t("models.enabledSection")}</ConfigSectionTitle>
+        <span className="enabled-models-count">
+          {t("models.enabledCount", { enabled: provider.enabledCount, total: provider.models.length })}
+        </span>
+        <ConfigButton
+          size="small"
+          disabled={busy || !bulk.canEnable}
+          onClick={() => runBulk(true, bulk.enableRefs)}
+        >
+          {filtered ? t("models.enableShown") : t("models.enableAll")}
+        </ConfigButton>
+        <ConfigButton
+          size="small"
+          disabled={busy || !bulk.canDisable}
+          title={!bulk.canDisable && bulk.disableRefs.length > 0 ? t("models.enabledLastModel") : undefined}
+          onClick={() => runBulk(false, bulk.disableRefs)}
+        >
+          {filtered ? t("models.disableShown") : t("models.disableAll")}
+        </ConfigButton>
+      </div>
+
+      {!view?.editable && <div className="enabled-models-note">{t("models.enabledProjectScope")}</div>}
+      {failure && (
+        <div className="enabled-models-error">
+          {failure.messageKey ? t(failure.messageKey) : failure.message}
+        </div>
+      )}
+
+      {custom ? (
+        <div className="enabled-models-note">{t("models.enabledCustomHint")}</div>
+      ) : (
+        <>
+          {provider.models.length > 8 && (
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder={t("models.enabledFilterPlaceholder", { count: provider.models.length })}
+              aria-label={t("models.enabledFilter")}
+              className="enabled-models-filter"
+            />
+          )}
+          <div className="enabled-models-list">
+            {shown.length === 0 ? (
+              <div className="enabled-models-empty">{t("models.enabledNoMatches")}</div>
+            ) : shown.map((model) => {
+              const lastOne = isLastEnabledModel(view, model);
+              return (
+                <div key={model.ref} className="enabled-models-row">
+                  <span className="enabled-models-row-text">
+                    <span className="enabled-models-row-name">{model.name}</span>
+                    <code className="enabled-models-row-id">{model.id}</code>
+                  </span>
+                  {model.thinkingPin && (
+                    <span className="enabled-models-pin" title={t("models.enabledPinHint")}>
+                      {model.thinkingPin}
+                    </span>
+                  )}
+                  <ConfigSwitch
+                    checked={model.enabled}
+                    loading={pending === model.ref}
+                    disabled={busy || !view?.editable || lastOne}
+                    label={lastOne
+                      ? t("models.enabledLastModel")
+                      : t("models.enabledToggle", { model: model.name })}
+                    onChange={(checked) => controller.setModels(model.ref, [model.ref], checked)}
+                  />
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

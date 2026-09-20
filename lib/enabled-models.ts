@@ -1,0 +1,300 @@
+/**
+ * Editing of the `enabledModels` setting for the Models panel.
+ *
+ * `enabledModels` is a whitelist of pi `--models` patterns, so turning one
+ * model off implies spelling out everything that stays on. pi's TUI solves that
+ * by rewriting the whole list from the models it can see right now
+ * (`/scoped-models` + Ctrl+S). pi-web must not: `ModelRuntime.getAvailable()`
+ * only returns models of providers with configured auth, so a full rewrite
+ * while the user is logged out of a provider would silently delete every entry
+ * they had for it, and it would also flatten hand-written globs and drop
+ * `:thinkingLevel` pins.
+ *
+ * Every operation here is therefore a *minimal edit* of the existing pattern
+ * list:
+ * - a pattern that matches nothing available is never touched (it belongs to a
+ *   signed-out provider or another machine),
+ * - only the pattern that actually covers a model being switched off is
+ *   expanded, in place, into explicit `provider/modelId` entries that keep the
+ *   original `:level` suffix,
+ * - entry order is preserved, because it is pi's model cycling order and the
+ *   fallback for the initial model of a new session.
+ *
+ * The functions are pure: pattern matching itself (minimatch globs, fuzzy
+ * matching, alias preference, `:level` suffixes) belongs to the SDK resolver
+ * and reaches this module as a pre-computed `PatternResolution[]`. See
+ * `lib/enabled-models-runtime.ts`.
+ */
+
+/** How one configured pattern resolves against the available models. */
+export interface PatternResolution {
+  /** The pattern exactly as stored in settings. */
+  pattern: string;
+  /** `provider/modelId` references the pattern matches, in resolver order. */
+  matched: string[];
+  /** Thinking level pinned by a `:level` suffix, when the pattern carries one. */
+  pin?: string;
+}
+
+export interface EnabledModelsInput {
+  /** `enabledModels` as stored; `undefined` means every model is enabled. */
+  patterns: string[] | undefined;
+  /** Every available `provider/modelId`, grouped by provider in display order. */
+  availableRefs: readonly string[];
+  /** Resolution of each entry of `patterns`, index-aligned. */
+  resolutions: readonly PatternResolution[];
+}
+
+export interface EnabledModelsState {
+  /** True when no pattern narrows the list, so the selector shows everything. */
+  allEnabled: boolean;
+  /** Enabled references, restricted to what is available right now. */
+  enabled: string[];
+  /** `provider/modelId` → thinking level pinned by a `:level` pattern. */
+  pins: Record<string, string>;
+  /** Patterns that match no available model; preserved by every edit. */
+  stalePatterns: string[];
+}
+
+export interface EnabledModelsModelView {
+  id: string;
+  name: string;
+  /** `provider/modelId`, the reference used by every edit. */
+  ref: string;
+  enabled: boolean;
+  /** Thinking level pinned by a `:level` pattern; read-only in pi-web. */
+  thinkingPin?: string;
+}
+
+export interface EnabledModelsProviderView {
+  id: string;
+  name: string;
+  /**
+   * `builtin` covers pi's own providers and any provider an extension
+   * registered; both own their model lists, so individual models can only be
+   * hidden through `enabledModels`. `custom` providers come from models.json,
+   * where a model can simply be deleted, so they are switched as a whole.
+   */
+  kind: "builtin" | "custom";
+  enabledCount: number;
+  models: EnabledModelsModelView[];
+}
+
+/** Payload of `GET`/`PUT /api/models/enabled`, shared with the browser. */
+export interface EnabledModelsView {
+  /** True when nothing narrows the model list. */
+  allEnabled: boolean;
+  patterns: string[] | null;
+  /** Configured patterns that match no available model; every edit keeps them. */
+  stalePatterns: string[];
+  enabledTotal: number;
+  availableTotal: number;
+  providers: EnabledModelsProviderView[];
+  /** Which settings file the effective value comes from. */
+  scope: "global" | "project";
+  /** False when project settings shadow the global value pi-web can write. */
+  editable: boolean;
+  modelError?: string;
+}
+
+export type EnabledModelsEdit =
+  | { ok: true; patterns: string[] | undefined; changed: boolean }
+  | { ok: false; reason: "last-model" };
+
+/** Provider id of a `provider/modelId` reference (model ids may contain `/`). */
+export function modelRefProvider(ref: string): string {
+  const slash = ref.indexOf("/");
+  return slash < 0 ? ref : ref.slice(0, slash);
+}
+
+/** Working copy of one configured pattern. */
+interface Entry {
+  pattern: string;
+  matched: string[];
+  pin?: string;
+}
+
+function toEntries(resolutions: readonly PatternResolution[]): Entry[] {
+  return resolutions.map((resolution) => ({
+    pattern: resolution.pattern,
+    matched: [...resolution.matched],
+    ...(resolution.pin ? { pin: resolution.pin } : {}),
+  }));
+}
+
+function enabledRefs(entries: readonly Entry[]): string[] {
+  const seen = new Set<string>();
+  const refs: string[] = [];
+  for (const entry of entries) {
+    for (const ref of entry.matched) {
+      if (seen.has(ref)) continue;
+      seen.add(ref);
+      refs.push(ref);
+    }
+  }
+  return refs;
+}
+
+function formatEntry(ref: string, pin?: string): string {
+  return pin ? `${ref}:${pin}` : ref;
+}
+
+function providerOrder(availableRefs: readonly string[]): string[] {
+  const providers: string[] = [];
+  for (const ref of availableRefs) {
+    const provider = modelRefProvider(ref);
+    if (!providers.includes(provider)) providers.push(provider);
+  }
+  return providers;
+}
+
+function refsOfProvider(availableRefs: readonly string[], provider: string): string[] {
+  return availableRefs.filter((ref) => modelRefProvider(ref) === provider);
+}
+
+/**
+ * Make the current selection explicit so a single toggle can edit it.
+ *
+ * "Everything enabled" is stored as no patterns at all (or as patterns that all
+ * went stale). Materializing it as one `provider/*` glob per provider keeps the
+ * written setting short and lets models added later stay enabled, unlike the
+ * TUI, which writes out every model id.
+ */
+function materializeEntries(input: EnabledModelsInput): Entry[] {
+  const entries = toEntries(input.resolutions);
+  if (enabledRefs(entries).length > 0) return entries;
+  for (const provider of providerOrder(input.availableRefs)) {
+    entries.push({
+      pattern: `${provider}/*`,
+      matched: refsOfProvider(input.availableRefs, provider),
+    });
+  }
+  return entries;
+}
+
+/**
+ * Replace the entries of a fully enabled provider with a single `provider/*`.
+ *
+ * Only called for providers the caller just enabled, so an unrelated
+ * hand-written list is never rewritten. Skipped when any pattern touching the
+ * provider pins a thinking level, since a glob cannot carry per-model pins.
+ */
+function collapseProvider(entries: Entry[], availableRefs: readonly string[], provider: string): Entry[] {
+  const providerRefs = refsOfProvider(availableRefs, provider);
+  if (providerRefs.length === 0) return entries;
+
+  const providerSet = new Set(providerRefs);
+  const involved = entries.filter((entry) => entry.matched.some((ref) => providerSet.has(ref)));
+  if (involved.some((entry) => entry.pin)) return entries;
+
+  const covered = new Set(involved.flatMap((entry) => entry.matched.filter((ref) => providerSet.has(ref))));
+  if (providerRefs.some((ref) => !covered.has(ref))) return entries;
+
+  const isSubset = (entry: Entry) => entry.matched.length > 0 && entry.matched.every((ref) => providerSet.has(ref));
+  const firstSubset = entries.findIndex(isSubset);
+  if (firstSubset < 0) return entries;
+
+  const glob: Entry = { pattern: `${provider}/*`, matched: providerRefs };
+  return entries
+    .map((entry, index) => (index === firstSubset ? glob : entry))
+    .filter((entry, index) => index === firstSubset || !isSubset(entry));
+}
+
+function serialize(entries: readonly Entry[], input: EnabledModelsInput): string[] | undefined {
+  const hasStale = entries.some((entry) => entry.matched.length === 0);
+  const hasPins = entries.some((entry) => entry.pin);
+  const enabled = new Set(enabledRefs(entries));
+  const coversEverything = input.availableRefs.every((ref) => enabled.has(ref));
+  // Drop the setting entirely once it stops narrowing anything, like the TUI —
+  // but never when it would discard stale entries or a thinking pin.
+  if (coversEverything && !hasStale && !hasPins) return undefined;
+  return entries.map((entry) => entry.pattern);
+}
+
+function samePatterns(a: string[] | undefined, b: string[] | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.length === b.length && a.every((pattern, index) => pattern === b[index]);
+}
+
+/** Current selection derived from the configured patterns. */
+export function computeEnabledModelsState(input: EnabledModelsInput): EnabledModelsState {
+  const entries = toEntries(input.resolutions);
+  const enabled = enabledRefs(entries);
+  const pins: Record<string, string> = {};
+  for (const entry of entries) {
+    if (!entry.pin) continue;
+    // The resolver keeps the first occurrence of a model, so its pin wins.
+    for (const ref of entry.matched) pins[ref] ??= entry.pin;
+  }
+  // pi falls back to every available model when the patterns resolve to
+  // nothing, so a fully stale list reads as "all enabled" here too.
+  const allEnabled = enabled.length === 0;
+  return {
+    allEnabled,
+    enabled: allEnabled ? [...input.availableRefs] : enabled,
+    pins,
+    stalePatterns: entries.filter((entry) => entry.matched.length === 0).map((entry) => entry.pattern),
+  };
+}
+
+/**
+ * Turn `refs` on or off with the smallest possible edit of the pattern list.
+ *
+ * Returns `{ ok: false, reason: "last-model" }` when the edit would leave no
+ * enabled model: pi treats an empty scope as "no scope" and shows every model
+ * again, so disabling the last one would silently mean the opposite.
+ */
+export function setModelsEnabled(
+  input: EnabledModelsInput,
+  refs: readonly string[],
+  enabled: boolean,
+): EnabledModelsEdit {
+  const available = new Set(input.availableRefs);
+  const targets = [...new Set(refs.filter((ref) => available.has(ref)))];
+  if (targets.length === 0) return { ok: true, patterns: input.patterns, changed: false };
+
+  let entries = materializeEntries(input);
+
+  if (enabled) {
+    const current = new Set(enabledRefs(entries));
+    const appendedProviders = new Set<string>();
+    for (const ref of targets) {
+      if (current.has(ref)) continue;
+      current.add(ref);
+      appendedProviders.add(modelRefProvider(ref));
+      entries.push({ pattern: ref, matched: [ref] });
+    }
+    for (const provider of appendedProviders) {
+      entries = collapseProvider(entries, input.availableRefs, provider);
+    }
+  } else {
+    const removed = new Set(targets);
+    const next: Entry[] = [];
+    for (const entry of entries) {
+      if (!entry.matched.some((ref) => removed.has(ref))) {
+        next.push(entry);
+        continue;
+      }
+      // Expand only this pattern, keeping its thinking pin on each survivor.
+      for (const ref of entry.matched.filter((matched) => !removed.has(matched))) {
+        next.push({ pattern: formatEntry(ref, entry.pin), matched: [ref], ...(entry.pin ? { pin: entry.pin } : {}) });
+      }
+    }
+    if (enabledRefs(next).length === 0) return { ok: false, reason: "last-model" };
+    entries = next;
+  }
+
+  const patterns = serialize(entries, input);
+  return { ok: true, patterns, changed: !samePatterns(patterns, input.patterns) };
+}
+
+/**
+ * Remove the scope entirely so every model is enabled again.
+ *
+ * This is the one operation that also drops stale patterns: keeping them would
+ * re-narrow the selector the moment their provider is signed in again, which is
+ * the opposite of what "show every model" asks for.
+ */
+export function clearEnabledModels(input: EnabledModelsInput): EnabledModelsEdit {
+  return { ok: true, patterns: undefined, changed: input.patterns !== undefined };
+}
