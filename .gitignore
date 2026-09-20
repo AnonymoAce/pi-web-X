@@ -47,3 +47,17 @@ yarn-error.log*
 next-env.d.ts
 .factory
 e2e_*.mjs
+
+# --- 本机工作产物：不得上传（隐私脱敏类）---
+/docs/workspace-log/
+/.pi/
+/docs/specs/
+/backup/
+/rollbacks/
+/.bak/
+/.tmp/
+*.log
+*.pem
+*.key
+id_rsa*
+credentials*.json
