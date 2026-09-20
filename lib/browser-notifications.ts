@@ -37,6 +37,7 @@ export function isBlockingExtensionUiRequest(
 ): request is BlockingExtensionUiRequest {
   switch (request.method) {
     case "select":
+    case "multi-select":
     case "confirm":
     case "input":
     case "editor":

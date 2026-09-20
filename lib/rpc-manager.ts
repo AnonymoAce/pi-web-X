@@ -1521,6 +1521,13 @@ export class AgentSessionWrapper {
         opts?.timeout,
         opts?.signal,
       ),
+      multiSelect: (title, options, opts) => this.requestExtensionUi(
+        { method: "multi-select", title, options, ...(opts?.timeout ? { timeout: opts.timeout } : {}) },
+        undefined,
+        (response) => "values" in response ? response.values : undefined,
+        opts?.timeout,
+        opts?.signal,
+      ),
       confirm: (title, message, opts) => this.requestExtensionUi(
         { method: "confirm", title, message, ...(opts?.timeout ? { timeout: opts.timeout } : {}) },
         false,

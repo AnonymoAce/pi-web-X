@@ -3,22 +3,38 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const source = await readFile(new URL("./ChatWindow.tsx", import.meta.url), "utf8");
-const dialogSource = source.slice(source.indexOf("function ExtensionDialog"));
-const customSource = source.slice(source.indexOf("function ExtensionCustomPanel"));
+const dialogStart = source.indexOf("function ExtensionDialog");
+const dialogSource = source.slice(dialogStart, source.indexOf("type ExtensionCustomRequest"));
+const customStart = source.indexOf("function ExtensionCustomPanel");
+const customEnd = source.indexOf("\n}", source.indexOf("</AnsiText>", customStart));
+const customSource = source.slice(customStart, customEnd > customStart ? customEnd : undefined);
 
-test("confines extension overlays to the content region above the composer", () => {
+test("keeps extension requests inline in the message flow instead of overlaying it", () => {
   assert.doesNotMatch(source, /function ExtensionRequestSheet/);
+  // Both cards render inside the scroller, after the message list and before the composer.
   assert.match(
     source,
-    /className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden"[\s\S]*?<ExtensionDialog[\s\S]*?<ExtensionCustomPanel[\s\S]*?className="relative shrink-0"[\s\S]*?{chatInputElement}/,
+    /className="min-w-0 flex-1 overflow-x-hidden overflow-y-auto[\s\S]*?<ExtensionDialog[\s\S]*?<ExtensionCustomPanel[\s\S]*?className="relative shrink-0"[\s\S]*?{chatInputElement}/,
   );
-  assert.match(dialogSource, /position: "absolute"[\s\S]*?inset: 0/);
-  assert.match(dialogSource, /pointerEvents: "none"/);
-  assert.match(dialogSource, /pointerEvents: "auto"/);
-  assert.match(customSource, /position: "absolute"[\s\S]*?inset: 0/);
-  assert.match(customSource, /pointerEvents: "none"/);
+  // Neither card is an absolute overlay any more.
+  // The card slot itself is static flow; the only absolute box left in the panel is the
+  // hidden keystroke-capture textarea, which is not an overlay.
+  assert.doesNotMatch(dialogSource, /position: "absolute"/);
+  assert.doesNotMatch(dialogSource, /inset: 0/);
+  assert.doesNotMatch(customSource, /inset: 0/);
+  assert.match(customSource, /margin: "12px 0"/);
+  assert.doesNotMatch(dialogSource, /pointerEvents: "none"/);
   assert.doesNotMatch(source, /z-\[100\]|zIndex: 100/);
-  assert.match(customSource, /maxHeight: "min\(760px, 100%\)"/);
+  // Cards stay bounded once expanded inside the flow.
+  assert.match(dialogSource, /maxHeight: "min\(640px, 70vh\)"/);
+  assert.match(customSource, /maxHeight: "min\(640px, 70vh\)"/);
+});
+
+test("reveals a freshly arrived inline request without stealing the scroll position", () => {
+  assert.match(source, /function useInlineReveal<T extends HTMLElement>\(\)/);
+  assert.match(source, /ref\.current\?\.scrollIntoView\(\{ block: "nearest" \}\)/);
+  assert.match(dialogSource, /const revealRef = useInlineReveal<HTMLDivElement>\(\)/);
+  assert.match(customSource, /const revealRef = useInlineReveal<HTMLDivElement>\(\)/);
 });
 
 test("adds collapse without replacing cancel", () => {
@@ -38,7 +54,22 @@ test("renders extension confirmation and options as markdown", () => {
 test("preserves title newlines like pi's TUI and keeps long titles from hiding the body", () => {
   const header = dialogSource.slice(dialogSource.indexOf('role="dialog"'), dialogSource.indexOf("{request.method === \"confirm\""));
   assert.match(header, /whiteSpace: "pre-wrap", overflowWrap: "anywhere" \}\}>\{request\.title\}/);
-  assert.match(header, /maxHeight: "50%", overflowY: "auto" \}\}>[\s\S]*?\{request\.title\}/);
+  assert.match(header, /maxHeight: "40vh", overflowY: "auto" \}\}>[\s\S]*?\{request\.title\}/);
+});
+
+test("offers a multi-select method with checkboxes, keyboard toggling and a custom answer", () => {
+  assert.match(source, /method: "select" \| "multi-select" \| "confirm" \| "input" \| "editor"/);
+  assert.match(dialogSource, /request\.method === "multi-select" && \(/);
+  assert.match(dialogSource, /role="checkbox"/);
+  assert.match(dialogSource, /aria-checked=\{checked\}/);
+  assert.match(dialogSource, /onClick=\{\(\) => toggleOption\(option\)\}/);
+  assert.match(dialogSource, /event\.key !== "Enter" && event\.key !== " "/);
+  assert.match(dialogSource, /const \[selectedOptions, setSelectedOptions\] = useState<Set<string>>/);
+  assert.match(dialogSource, /const \[customAnswer, setCustomAnswer\] = useState\(""\)/);
+  // Submitting sends every checked option plus the typed answer, and not the single-value path.
+  assert.match(dialogSource, /onRespond\(request, \{ values: extra \? \[\.\.\.picked, extra\] : picked \}\)/);
+  // The generic Submit button still covers select/multi-select; only plain select auto-submits on click.
+  assert.match(dialogSource, /request\.method !== "select" && request\.method !== "multi-select"/);
 });
 
 test("resets collapse state when a new extension request arrives", () => {

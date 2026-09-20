@@ -14,6 +14,8 @@ import {
   readSessionHeader,
 } from "@/lib/session-reader";
 import { sessionPathKey } from "@/lib/session-path";
+import { buildOutlineSourceEntries } from "@/lib/outline-model";
+import { collectSessionWrittenFiles } from "@/lib/session-changes";
 import { abortSubagent, getRpcSession, getRpcSessionInfos } from "@/lib/rpc-manager";
 import { projectTreeForResponse } from "@/lib/project-tree";
 import { computeSessionTotalActiveMs } from "@/lib/session-timing";
@@ -65,6 +67,16 @@ export async function GET(
       tail,
       sessionId: id, // local: lazy URLs for historical tool-result images
     });
+    // The chat window is a lazily-paged tail, so its outline anchors cover only
+    // that window and the rail disappears in long sessions. ?outline=1 also
+    // summarizes the FULL active branch (no tail), but ships only the anchor
+    // list (tens of ~60-char titles) — never the full context.
+    const fullContext = searchParams.has("outline")
+      ? buildSessionContext(entries as never, leafId, { deferThinking, deferToolResultImages, sessionId: id })
+      : null;
+    const outlineEntries = fullContext
+      ? buildOutlineSourceEntries(fullContext.messages, fullContext.entryIds)
+      : undefined;
     const totalActiveMs = computeSessionTotalActiveMs(entries);
     // Cumulative usage over ALL entries, including history compacted away —
     // the same aggregation the SDK's getSessionStats() uses. Lets the client
@@ -85,6 +97,17 @@ export async function GET(
       : null;
     const toolNames = readSubagentSessionResources(entries as never)?.tools
       ?? readSessionToolSelection(entries as never);
+    // ?changes=1: the written-file list must cover the FULL active branch. The
+    // chat window only ever holds a lazily-paged tail (tail is clamped to <=1000
+    // entries), so aggregating the tail silently drops a long session's older
+    // writes. Ship only the path list (tens of entries) — never the full context
+    // (megabytes on long sessions).
+    const changesContext = searchParams.has("changes")
+      ? buildSessionContext(entries as never, leafId, { sessionId: id })
+      : null;
+    const writtenFiles = changesContext
+      ? collectSessionWrittenFiles(changesContext.messages, header?.cwd ?? null)
+      : undefined;
     const info = header ? (await attachSessionProjectInfo([{
       path: filePath,
       id: header.id,
@@ -119,6 +142,8 @@ export async function GET(
         context,
         stats,
         totalActiveMs,
+        ...(outlineEntries !== undefined ? { outlineEntries } : {}),
+        ...(writtenFiles !== undefined ? { writtenFiles } : {}),
         ...(toolNames !== undefined ? { toolNames } : {}),
         ...(wrapperRebuilt ? { wrapperRebuilt: true } : {}),
       },

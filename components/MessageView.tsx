@@ -11,13 +11,18 @@ import { parseCompactionSummary } from "@/lib/compaction-summary";
 import { getAssistantErrorMessage, getThinkingPreview, isAssistantTruncated, isEmptyThinkingBlock } from "@/lib/message-display";
 import { parseUnifiedPatch, type SplitDiffCell, type SplitDiffFile } from "@/lib/patch";
 import { applyPatchPreviewToFiles, applyPatchResultHasFailures, extractApplyPatchPaths, getApplyPatchInputText, parseApplyPatchInput } from "@/lib/apply-patch";
-import { isApplyPatchToolName, isEditToolName } from "@/lib/tool-names";
-import { isToolCallExpanded, setToolCallExpanded } from "@/lib/tool-call-expansion";
+import { isApplyPatchToolName, isEditToolName, isTodoToolName } from "@/lib/tool-names";
+import { extractTodoList } from "@/lib/todo-tool";
+import { isToolCallCollapsedByUser, isToolCallExpanded, setToolCallExpanded } from "@/lib/tool-call-expansion";
 import { isThinkingExpandedByDefault, THINKING_EXPANDED_EVENT } from "@/lib/thinking-expansion-preference";
 import { TurnWrittenFiles } from "./TurnWrittenFiles";
 import type { WrittenFile } from "@/lib/turn-written-files";
 import { skillExpansionToCommand } from "@/lib/slash-display";
 import type { SubagentToolDetails } from "@/lib/subagent-extension";
+import { SubagentInlineStream } from "./SubagentInlineStream";
+import { TodoToolCard } from "./TodoToolCard";
+import { isActiveSubagentStatus } from "@/lib/subagent-stream";
+import type { SubagentSessionStatus } from "@/lib/types";
 import type {
   AgentMessage,
   UserMessage,
@@ -1043,9 +1048,43 @@ function isSubagentToolDetails(value: unknown): value is SubagentToolDetails {
   return details.kind === "pi-web-subagent" && typeof details.sessionId === "string";
 }
 
+/** Live entry that useAgentSession keeps for a tool call still in flight. */
+type LiveToolResult = ToolResultMessage & { running?: boolean; startedAt?: number };
+
+/**
+ * Seconds elapsed since a running tool call started, refreshed once a second.
+ * Returns undefined when the call is not running so the header falls back to
+ * the recorded duration.
+ */
+function useRunningSeconds(startedAt: number | undefined, active: boolean): number | undefined {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!active || startedAt === undefined) return;
+    const id = setInterval(() => setTick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [active, startedAt]);
+  if (!active || startedAt === undefined) return undefined;
+  return Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+}
+
+function liveResultText(result: ToolResultMessage): string {
+  return result.content
+    .filter((b): b is { type: "text"; text: string } => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+}
+
 function ToolCallBlock({ block, result, duration, onOpenSession }: { block: ToolCallContent; result?: ToolResultMessage; duration?: number; onOpenSession?: (sessionId: string) => void }) {
   const { t } = useI18n();
-  const [expanded, setExpanded] = useState(() => isToolCallExpanded(block.toolCallId));
+  const subagent = isSubagentToolDetails(result?.details) ? result.details : null;
+  // A running sub-agent card opens itself on first paint, so opening a session
+  // mid-run lands on the stream instead of a collapsed summary. An explicit
+  // user collapse wins, including across the remounts a streaming message goes
+  // through.
+  const [expanded, setExpanded] = useState(() =>
+    isToolCallExpanded(block.toolCallId)
+    || (!isToolCallCollapsedByUser(block.toolCallId)
+      && Boolean(subagent && isActiveSubagentStatus(subagent.status))));
   const toggleExpanded = () => {
     const next = !expanded;
     setToolCallExpanded(block.toolCallId, next);
@@ -1064,11 +1103,81 @@ function ToolCallBlock({ block, result, duration, onOpenSession }: { block: Tool
   const resultText = result
     ? result.content.filter((b): b is { type: "text"; text: string } => b.type === "text").map((b) => b.text).join("\n")
     : null;
+  // A `todo` result is markdown written for humans (see lib/todo-tool), so the
+  // card owns that text and the generic panes below step aside while it parses.
+  // Non-view replies — acknowledgements, errors — yield null and keep the
+  // ordinary rendering path.
+  const todoList = isTodoToolName(block.toolName) ? extractTodoList(result) : null;
   const resultImages = getMessageImages(result?.content ?? []);
   const resultIsEmpty = resultText === null ? false : (resultText.trim() === "(no output)" || resultText.trim() === "");
   const isError = (result?.isError ?? false)
     || (isApplyPatchToolName(block.toolName) && applyPatchResultHasFailures(result?.details));
-  const subagent = isSubagentToolDetails(result?.details) ? result.details : null;
+  // Stream status reported by the child session itself. Null until the first
+  // poll answers, so the card falls back to the persisted details status.
+  const [subagentStatus, setSubagentStatus] = useState<SubagentSessionStatus | null>(null);
+  const [stopping, setStopping] = useState(false);
+  const [stopError, setStopError] = useState<string | null>(null);
+
+  // `running` marks the live entry useAgentSession writes while the call is in
+  // flight; the persisted toolResult replaces it under the same toolCallId once
+  // the turn advances, so the card switches state instead of remounting.
+  const live = result as LiveToolResult | undefined;
+  const isRunning = live?.running === true;
+  // Only entries useAgentSession writes carry `startedAt`; a persisted
+  // toolResult never does, so its presence identifies the live entry.
+  const isLiveEntry = live?.startedAt !== undefined;
+  const runningSeconds = useRunningSeconds(live?.startedAt, isRunning);
+  const liveText = isLiveEntry && result ? liveResultText(result) : "";
+  const hasLiveText = liveText.trim() !== "";
+
+  // A background sub-agent outlives its tool call, and a finished one can leave
+  // a "running" status behind in the persisted details. The child session is
+  // the authority: once it has answered, its status decides alone.
+  const subagentRunning = subagent
+    ? isActiveSubagentStatus(subagentStatus)
+      || (subagentStatus === null && isActiveSubagentStatus(subagent.status))
+    : false;
+
+  // Persist the auto-expansion so it survives the remounts a streaming message
+  // goes through. A user collapse already cleared the flag, so this never
+  // re-opens a card the user closed.
+  useEffect(() => {
+    if (!expanded || !subagent || !subagentRunning) return;
+    if (isToolCallCollapsedByUser(block.toolCallId)) return;
+    setToolCallExpanded(block.toolCallId, true);
+  }, [expanded, subagent, subagentRunning, block.toolCallId]);
+
+  const stopSubagent = () => {
+    if (!subagent || stopping) return;
+    setStopping(true);
+    setStopError(null);
+    void fetch(`/api/subagents/${encodeURIComponent(subagent.sessionId)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "abort" }),
+    })
+      .then(async (response) => {
+        if (response.ok) return;
+        const payload = await response.json().catch(() => null) as { error?: string } | null;
+        setStopError(payload?.error || `HTTP ${response.status}`);
+      })
+      .catch((error: unknown) => {
+        setStopError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => setStopping(false));
+  };
+
+  // Keep the finished result open across the handoff: once the persisted
+  // toolResult replaces the live entry the body moves behind `expanded`, so
+  // without this it would collapse the moment the call stops running. Fires
+  // once per card, leaving any later manual collapse alone.
+  const autoExpandedRef = useRef(false);
+  useEffect(() => {
+    if (!hasLiveText || autoExpandedRef.current) return;
+    autoExpandedRef.current = true;
+    setToolCallExpanded(block.toolCallId, true);
+    setExpanded(true);
+  }, [hasLiveText, block.toolCallId]);
 
   return (
     <div
@@ -1076,8 +1185,16 @@ function ToolCallBlock({ block, result, duration, onOpenSession }: { block: Tool
         borderRadius: 7,
         overflow: "hidden",
         fontSize: 12,
-        border: isError ? "1px solid rgba(248,113,113,0.45)" : "1px solid rgba(34,197,94,0.25)",
-        background: isError ? "rgba(248,113,113,0.05)" : "rgba(34,197,94,0.04)",
+        border: isError
+          ? "1px solid rgba(248,113,113,0.45)"
+          : isRunning
+          ? "1px solid var(--border)"
+          : "1px solid rgba(34,197,94,0.25)",
+        background: isError
+          ? "rgba(248,113,113,0.05)"
+          : isRunning
+          ? "var(--bg-subtle)"
+          : "rgba(34,197,94,0.04)",
       }}
     >
       {/* ── Tool call header ── */}
@@ -1105,13 +1222,41 @@ function ToolCallBlock({ block, result, duration, onOpenSession }: { block: Tool
           <span style={{ color: "var(--text-dim)", fontFamily: "var(--font-mono)", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
             {isStreamingInput ? t("chat.generatingToolInput") : (patchLabel ?? getToolPreview(block))}
           </span>
-          {duration !== undefined && (
-            <span style={{ fontSize: 11, color: "var(--text-dim)", flexShrink: 0, fontVariantNumeric: "tabular-nums" }}>{duration}s</span>
+          {isRunning && (
+            <span
+              style={{
+                flexShrink: 0,
+                padding: "1px 6px",
+                borderRadius: 999,
+                fontSize: 10,
+                fontWeight: 600,
+                color: "var(--accent)",
+                background: "var(--bg-subtle)",
+                border: "1px solid var(--border)",
+              }}
+            >
+              {t("agentSwitcher.status.running")}
+            </span>
+          )}
+          {(duration !== undefined || runningSeconds !== undefined) && (
+            <span style={{ fontSize: 11, color: "var(--text-dim)", flexShrink: 0, fontVariantNumeric: "tabular-nums" }}>{duration ?? runningSeconds}s</span>
           )}
           <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="var(--text-dim)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, transform: expanded ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}>
             <polyline points="2 3.5 5 6.5 8 3.5" />
           </svg>
         </button>
+        {subagent && subagentRunning && (
+          <button
+            type="button"
+            onClick={stopSubagent}
+            disabled={stopping}
+            title={t("subagent.stop")}
+            aria-label={t("subagent.stop")}
+            style={{ width: 32, display: "grid", placeItems: "center", border: "none", borderLeft: "1px solid var(--border)", background: "none", color: stopError ? "#f87171" : "var(--text-muted)", cursor: stopping ? "default" : "pointer", opacity: stopping ? 0.5 : 1, flexShrink: 0 }}
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" /></svg>
+          </button>
+        )}
         {subagent && onOpenSession && (
           <button
             type="button"
@@ -1125,8 +1270,33 @@ function ToolCallBlock({ block, result, duration, onOpenSession }: { block: Tool
         )}
       </div>
 
+      {/* ── Sub-agent inline stream ── */}
+      {subagent && expanded && (
+        <div data-subagent-card style={{ borderTop: "1px solid var(--border)" }}>
+          <SubagentInlineStream
+            sessionId={subagent.sessionId}
+            active={subagentRunning}
+            onStatus={setSubagentStatus}
+          />
+        </div>
+      )}
+      {subagent && stopError && (
+        <div
+          data-subagent-stop-error
+          style={{
+            padding: "4px 10px",
+            color: "#f87171",
+            background: "rgba(248,113,113,0.05)",
+            borderTop: "1px solid rgba(248,113,113,0.25)",
+            fontSize: 11,
+          }}
+        >
+          {`${t("subagent.stopFailed")}: ${stopError}`}
+        </div>
+      )}
+
       {/* ── Expanded: input args (only when no richer view exists) ── */}
-      {expanded && (isStreamingInput || !isEditTool) && !patchFiles && (
+      {expanded && !subagent && (isStreamingInput || !isEditTool) && !patchFiles && (
         <pre
           style={{
             margin: 0,
@@ -1144,6 +1314,31 @@ function ToolCallBlock({ block, result, duration, onOpenSession }: { block: Tool
           {inputStr}
         </pre>
       )}
+
+      {/* ── Live output while the tool is still running — visible without expanding ── */}
+      {hasLiveText && !todoList && (
+        <pre
+          style={{
+            margin: 0,
+            padding: "8px 10px",
+            borderTop: "1px solid var(--border)",
+            background: "var(--bg)",
+            color: "var(--text-muted)",
+            fontSize: "calc(12px + var(--chat-font-size-offset, 0px))",
+            lineHeight: 1.5,
+            maxHeight: 400,
+            overflow: "auto",
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-all",
+          }}
+        >
+          {liveText}
+        </pre>
+      )}
+
+      {/* ── Todo list — the card carries its own collapse header, so it sits
+          outside the `expanded` guard and the list is visible at a glance ── */}
+      {todoList && <TodoToolCard toolCallId={block.toolCallId} data={todoList} />}
 
       {/* ── Result images — always visible, independent of the collapsed details ── */}
       {resultImages.length > 0 && <ResultImages images={resultImages} isError={isError} />}
@@ -1163,7 +1358,7 @@ function ToolCallBlock({ block, result, duration, onOpenSession }: { block: Tool
           isError={isError}
         />
       )}
-      {expanded && result && !patchFiles && (
+      {expanded && result && !isLiveEntry && !patchFiles && !todoList && (
         resultDiff ? (
           <PairedDiffResult
             diff={resultDiff}

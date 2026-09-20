@@ -42,7 +42,10 @@ test("contains chat content and inputs within the mobile viewport", () => {
   assert.match(cssSource, /\.markdown-body \{[\s\S]*?min-width: 0;[\s\S]*?max-width: 100%;[\s\S]*?overflow-x: hidden;/);
   assert.match(cssSource, /\.markdown-code-block \{[\s\S]*?min-width: 0;[\s\S]*?max-width: 100%;/);
   assert.match(chatWindowSource, /overflow-x-hidden overflow-y-auto/);
-  assert.match(chatWindowSource, /maxHeight: "min\(760px, 100%\)"/);
+  // The extension cards became inline flow (no longer absolute overlays), so the
+  // bounded height follows the inline card: min(640px, 70vh) instead of the old
+  // overlay's min(760px, 100%). Still bounded, which is what this test protects.
+  assert.match(chatWindowSource, /maxHeight: "min\(640px, 70vh\)"/);
   assert.match(chatInputSource, /flex: compact \? "none" : 1,\s*minWidth: 0,\s*width: "100%",/);
 });
 

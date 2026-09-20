@@ -16,6 +16,7 @@ import { SystemPromptPanel } from "./SystemPromptPanel";
 import { ToolDefinitionsPanel } from "./ToolDefinitionsPanel";
 import { AgentSessionPanel } from "./AgentSessionPanel";
 import { TerminalPanel } from "./TerminalPanel";
+import { SessionChangesPanel } from "./SessionChangesPanel";
 import { newTerminalTab, restoreTerminalTabs, TERMINAL_TABS_KEY, type TerminalTab } from "./terminal-tab-state";
 import { useTheme } from "@/hooks/useTheme";
 import { useI18n } from "@/hooks/useI18n";
@@ -169,6 +170,7 @@ export function AppShell() {
   const [projectTrustError, setProjectTrustError] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(() => !initialNavigation.sidebarCollapsed);
   const [rightPanelOpen, setRightPanelOpen] = useState(false);
+  const [sessionChangesOpen, setSessionChangesOpen] = useState(false);
   const [rightPanelExpanded, setRightPanelExpanded] = useState(false);
   const rightPanelFullWidth = rightPanelOpen && rightPanelExpanded && !isMobile;
   useEffect(() => {
@@ -2387,6 +2389,28 @@ export function AppShell() {
           </div>
           <button
             type="button"
+            data-session-changes-toggle=""
+            onClick={() => setSessionChangesOpen((open) => !open)}
+            aria-pressed={sessionChangesOpen}
+            title="本会话改动"
+            aria-label="本会话改动"
+            style={{
+              display: "flex", alignItems: "center", justifyContent: "center",
+              width: TOP_BAR_ICON_BUTTON_SIZE, height: TOP_BAR_ICON_BUTTON_SIZE, padding: 0,
+              background: sessionChangesOpen ? "var(--bg-selected)" : "transparent",
+              border: "none", borderLeft: "1px solid var(--border)",
+              color: sessionChangesOpen ? "var(--accent)" : "var(--text)",
+              cursor: "pointer", flexShrink: 0, transition: "color 0.12s",
+            }}
+            onMouseEnter={(event) => { if (!sessionChangesOpen) event.currentTarget.style.color = "var(--accent)"; }}
+            onMouseLeave={(event) => { if (!sessionChangesOpen) event.currentTarget.style.color = "var(--text)"; }}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M5 3h14v18H5z" /><path d="M9 8h6M9 12h6M9 16h4" />
+            </svg>
+          </button>
+          <button
+            type="button"
             className="file-panel-expand-button"
             onClick={handleRightPanelExpandToggle}
             aria-controls="file-panel"
@@ -2423,7 +2447,7 @@ export function AppShell() {
         </div>
 
         {/* Only the active viewer is mounted. Lightweight per-tab state is restored on activation. */}
-        <div style={{ flex: 1, minHeight: 0, overflow: "hidden", paddingBottom: "env(safe-area-inset-bottom)" }}>
+        <div style={{ position: "relative", flex: 1, minHeight: 0, overflow: "hidden", paddingBottom: "env(safe-area-inset-bottom)" }}>
           {activeFileTab?.filePath ? (
             <FileViewer
               key={`${activeFileTab.id}:${activeFileTab.viewerRevision ?? 0}`}
@@ -2453,6 +2477,15 @@ export function AppShell() {
                {translate("files.noneOpen")}
             </div>
           ) : null}
+          {sessionChangesOpen && (
+            <div style={{ position: "absolute", inset: 0, zIndex: 20, background: "var(--bg)", display: "flex", flexDirection: "column" }}>
+              <SessionChangesPanel
+                sessionId={selectedSession?.id ?? null}
+                cwd={selectedSession?.cwd ?? activeCwd ?? null}
+                onClose={() => setSessionChangesOpen(false)}
+              />
+            </div>
+          )}
           {terminalTabs.map((tab) => (
             <div key={tab.id} hidden={tab.id !== activeFileTabId} style={{ width: "100%", height: "100%" }}>
               <TerminalPanel

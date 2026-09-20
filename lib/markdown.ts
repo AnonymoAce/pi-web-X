@@ -6,18 +6,149 @@ import remarkFrontmatter from "remark-frontmatter";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 
+// rehype-sanitize's default schema carries no SVG vocabulary at all, so inline
+// <svg> in model output (dependency graphs, UML, flow charts, icons) had every
+// element unwrapped and only its bare text survived. The lists below cover the
+// subset those diagrams need: shapes, text, gradients, arrow markers, patterns,
+// clip paths, masks and <use>/<image> references.
+// Still blocked: script / style / iframe / object / embed / form (folded into
+// `strip` below), foreignObject (dropped with its subtree instead of leaking
+// it), and every `on*` handler -- the attribute white-list never names one, so
+// a handler cannot pass no matter which element carries it.
+const svgTagNames = [
+  "svg", "g", "defs", "symbol", "use", "title", "desc",
+  "path", "rect", "circle", "ellipse", "line", "polyline", "polygon",
+  "text", "tspan", "textPath", "image",
+  "marker", "pattern", "clipPath", "mask",
+  "linearGradient", "radialGradient", "stop",
+];
+
+// hast property names (camelCase) exactly as rehype-raw/parse5 emit them:
+// `stroke-width` arrives as `strokeWidth`, `xlink:href` as `xLinkHref`.
+const svgAttributeNames = [
+  "className", "id", "role", "ariaLabel", "ariaHidden",
+  "viewBox", "xmlns", "preserveAspectRatio",
+  "width", "height", "x", "y", "rx", "ry", "cx", "cy", "r",
+  "x1", "y1", "x2", "y2", "dx", "dy", "fx", "fy", "fr",
+  "d", "points", "pathLength", "transform",
+  "fill", "fillOpacity", "fillRule",
+  "stroke", "strokeWidth", "strokeLineCap", "strokeLineJoin",
+  "strokeDashArray", "strokeDashOffset", "opacity",
+  "markerStart", "markerMid", "markerEnd",
+  "markerWidth", "markerHeight", "markerUnits", "refX", "refY", "orient",
+  "gradientUnits", "gradientTransform", "spreadMethod",
+  "offset", "stopColor", "stopOpacity",
+  "patternUnits", "patternContentUnits", "patternTransform",
+  "clipPath", "clipPathUnits", "mask", "maskUnits", "maskContentUnits",
+  "href", "xLinkHref", "startOffset", "method", "spacing", "side",
+  "textAnchor", "dominantBaseline", "fontSize", "fontFamily", "fontWeight",
+  "fontStyle", "letterSpacing", "textLength", "lengthAdjust",
+];
+
+const svgAttributes: Record<string, string[]> = Object.fromEntries(
+  svgTagNames.map((tagName) => [tagName, svgAttributeNames]),
+);
+
 const markdownSanitizeSchema = {
   ...defaultSchema,
+  tagNames: [...(defaultSchema.tagNames ?? []), ...svgTagNames],
   attributes: {
     ...defaultSchema.attributes,
+    ...svgAttributes,
     code: [["className", /^language-./, "math-inline", "math-display"]],
   },
   protocols: {
     ...defaultSchema.protocols,
     href: [...(defaultSchema.protocols?.href ?? []), "file"],
+    // `xlink:href` is a distinct property name; without its own entry the
+    // protocol filter never runs for it, so `javascript:` would survive on
+    // <use> / <textPath> / <image>.
+    xLinkHref: [...(defaultSchema.protocols?.href ?? []), "file"],
   },
-  strip: [...(defaultSchema.strip || []), "iframe", "object", "style", "form"],
+  strip: [
+    ...(defaultSchema.strip || []),
+    "iframe",
+    "object",
+    "embed",
+    "style",
+    "form",
+    "foreignObject",
+  ],
 };
+
+// `rehype-sanitize` prefixes every `id` with `user-content-` (its DOM-clobbering
+// guard), which silently breaks SVG paint servers and <use> targets: the markup
+// says `fill="url(#grad)"` while the element is now `id="user-content-grad"`.
+// Rewriting the references to the prefixed ids keeps gradients, patterns, clip
+// paths, masks and arrow markers painting. Runs on the already-sanitized tree and
+// only prepends the schema's own prefix -- it never introduces a value that came
+// from the source document.
+const svgIdPrefix = markdownSanitizeSchema.clobberPrefix ?? "user-content-";
+const svgUrlReference = /url\(\s*(['"]?)#([^\s)'"<>]+)\1\s*\)/g;
+const svgBareReference = /^#([^\s"'<>()]+)$/;
+// Attributes whose value may hold a `url(#id)` paint-server reference.
+const svgUrlReferenceAttributes = new Set([
+  "fill",
+  "stroke",
+  "markerStart",
+  "markerMid",
+  "markerEnd",
+  "clipPath",
+  "mask",
+]);
+// Attributes where a bare `#id` is itself a fragment reference. `fill`/`stroke`
+// deliberately stay out: there a bare `#333` is a hex colour, not an id, and
+// rewriting it would turn a colour into `#user-content-333`.
+const svgBareReferenceAttributes = new Set(["href", "xLinkHref"]);
+
+// Inline SVG is authored at whatever size the model picked (often width="2400").
+// Same sizing contract the app already applies to `img`: cap it at the message
+// column and let `height:auto` keep the viewBox ratio, so a huge diagram cannot
+// blow the layout open. `overflow-x:auto` covers the viewBox-less diagrams whose
+// absolute coordinates cannot be scaled by the ratio -- those scroll inside the
+// SVG viewport instead of being clipped by `.markdown-body { overflow-x:hidden }`.
+const svgSizeStyle = "display:block;max-width:100%;height:auto;overflow-x:auto;";
+
+interface HastNode {
+  type: string;
+  tagName?: string;
+  properties?: Record<string, unknown>;
+  children?: HastNode[];
+}
+
+function rewriteSvgNode(node: HastNode, insideSvg: boolean): void {
+  const inSvg = insideSvg || node.tagName === "svg";
+
+  if (node.properties) {
+    if (inSvg) {
+      for (const [key, value] of Object.entries(node.properties)) {
+        if (typeof value !== "string") continue;
+        if (svgUrlReferenceAttributes.has(key)) {
+          node.properties[key] = value.replace(
+            svgUrlReference,
+            (_match, _quote: string, id: string) => `url(#${svgIdPrefix}${id})`,
+          );
+        }
+        if (svgBareReferenceAttributes.has(key)) {
+          node.properties[key] = value.replace(
+            svgBareReference,
+            (_match, id: string) => `#${svgIdPrefix}${id}`,
+          );
+        }
+      }
+    }
+
+    if (node.tagName === "svg") node.properties.style = svgSizeStyle;
+  }
+
+  for (const child of node.children ?? []) rewriteSvgNode(child, inSvg);
+}
+
+function rehypeSvgSupport() {
+  return (tree: unknown): void => {
+    rewriteSvgNode(tree as HastNode, false);
+  };
+}
 
 export function markdownUrlTransform(value: string): string {
   return /^file:/i.test(value) ? value : defaultUrlTransform(value);
@@ -375,11 +506,13 @@ export const markdownPreviewRemarkPlugins: ReactMarkdownOptions["remarkPlugins"]
 export const markdownRehypePlugins: ReactMarkdownOptions["rehypePlugins"] = [
   rehypeRaw,
   [rehypeSanitize, markdownSanitizeSchema],
+  rehypeSvgSupport,
   [rehypeKatex, { throwOnError: false, strict: false }],
 ];
 
 export const markdownPreviewRehypePlugins: ReactMarkdownOptions["rehypePlugins"] = [
   rehypeRaw,
   [rehypeSanitize, markdownSanitizeSchema],
+  rehypeSvgSupport,
   [rehypeKatex, { throwOnError: false, strict: false }],
 ];

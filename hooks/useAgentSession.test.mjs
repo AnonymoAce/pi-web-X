@@ -409,7 +409,11 @@ test("shows the latest streamed tool execution progress in the running phase", (
   assert.match(chatWindowSource, /chat\.runningNamedTool[\s\S]*latest\.progress/);
 });
 
-test("reconnects active shell output to its streaming tool call", () => {
+test("tracks every running tool call, not just the shell tools", () => {
+  const startSource = source.slice(
+    source.indexOf('case "tool_execution_start"'),
+    source.indexOf('case "tool_execution_update"'),
+  );
   const updateSource = source.slice(
     source.indexOf('case "tool_execution_update"'),
     source.indexOf('case "tool_execution_end"'),
@@ -419,10 +423,19 @@ test("reconnects active shell output to its streaming tool call", () => {
     source.indexOf('case "queue_update"'),
   );
 
-  assert.match(updateSource, /name === "bash" \|\| name === "powershell"/);
+  // The tool name must not gate the live entry: read/grep/find/ls also need a
+  // running card even though they stream no partial output.
+  assert.doesNotMatch(startSource, /name === "bash"/);
+  assert.doesNotMatch(updateSource, /name === "bash"/);
+  assert.match(startSource, /setActiveToolResults/);
+  assert.match(startSource, /running: true/);
+  assert.match(startSource, /startedAt: Date\.now\(\)/);
   assert.match(updateSource, /setActiveToolResults/);
   assert.match(updateSource, /content,/);
-  assert.match(endSource, /setActiveToolResults[\s\S]*next\.delete\(id\)/);
+  assert.match(updateSource, /startedAt: \(prev\.get\(id\) as LiveToolResult \| undefined\)\?\.startedAt \?\? Date\.now\(\)/);
+  // A streamed body is held (not dropped) until the persisted result replaces it.
+  assert.match(endSource, /setActiveToolResults[\s\S]*running: false[\s\S]*next\.delete\(id\)/);
+  assert.match(source, /case "message_end"[\s\S]*role === "toolResult"[\s\S]*next\.delete\(toolCallId\)/);
   assert.match(chatWindowSource, /const map = new Map\(activeToolResults\)/);
   assert.match(chatWindowSource, /<MessageView message=\{streamState\.streamingMessage as AgentMessage\} toolResults=\{toolResultsMap\}/);
 });

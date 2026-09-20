@@ -21,6 +21,7 @@ import { getPresetFromToolNames, getToolNamesForPreset, type ToolEntry, type Too
 import type { SessionStatsInfo } from "@/lib/pi-types";
 import { mergeSessionStats, type SessionFileStats } from "@/lib/session-stats";
 import { userMessageKey } from "@/lib/prompt-recovery";
+import type { OutlineSourceEntry } from "@/lib/outline-model";
 import { AgentEventConnection } from "@/lib/agent-event-connection";
 import { getToolExecutionProgress } from "@/lib/tool-execution-progress";
 import { updateExtensionWidgets } from "@/lib/extension-widgets";
@@ -35,6 +36,9 @@ import {
   streamReducer,
   type ClientAssistantMessageEvent,
 } from "@/lib/streaming-message";
+
+/** Tool result held live in `activeToolResults` while its call is still running. */
+type LiveToolResult = ToolResultMessage & { running?: boolean; startedAt?: number };
 
 export interface SessionData {
   sessionId: string;
@@ -55,6 +59,11 @@ export interface SessionData {
   stats?: SessionFileStats;
   /** True when GET ?force=1 dropped a stale live wrapper and rebuilt from disk. */
   wrapperRebuilt?: boolean;
+  /**
+   * Full-branch outline anchors (GET ?outline=1). The context window above is
+   * only a lazily-paged tail, so the rail cannot be built from it.
+   */
+  outlineEntries?: OutlineSourceEntry[];
 }
 
 interface AgentEvent {
@@ -95,7 +104,7 @@ function normalizeQueuedMessages(q?: { steering?: string[]; followUp?: string[] 
   return { steering: q?.steering ?? [], followUp: q?.followUp ?? [] };
 }
 
-type ExtensionUiDialogRequest = Extract<ExtensionUiRequest, { method: "select" | "confirm" | "input" | "editor" }>;
+type ExtensionUiDialogRequest = Extract<ExtensionUiRequest, { method: "select" | "multi-select" | "confirm" | "input" | "editor" }>;
 type ExtensionUiCustomRequest = Extract<ExtensionUiRequest, { method: "custom" }>;
 export type NoticeType = "info" | "success" | "warning" | "error";
 
@@ -301,6 +310,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [activeToolResults, setActiveToolResults] = useState<Map<string, ToolResultMessage>>(new Map());
   const [entryIds, setEntryIds] = useState<string[]>([]);
+  const [outlineEntries, setOutlineEntries] = useState<OutlineSourceEntry[]>([]);
   const [historyCursor, setHistoryCursor] = useState<string | null>(null);
   const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
   const [streamState, dispatch] = useReducer(streamReducer, INITIAL_STREAMING_STATE);
@@ -502,7 +512,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     let messagesLoaded = false;
     try {
       if (showLoading) setLoading(true);
-      const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1" });
+      const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1", outline: "1" });
       if (options?.force) params.set("force", "1");
       const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`);
       if (res.status === 404) {
@@ -511,6 +521,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           setActiveLeafId(null);
           setMessages([]);
           setEntryIds([]);
+          setOutlineEntries([]);
           setHistoryCursor(null);
           setHasEarlierMessages(false);
           setError(null);
@@ -525,6 +536,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setActiveLeafId(d.leafId);
       setMessages(persistedMessages);
       setEntryIds(d.context.entryIds ?? []);
+      setOutlineEntries(d.outlineEntries ?? []);
       setHistoryCursor(d.context.oldestEntryId);
       setHasEarlierMessages(d.context.hasMore);
       setToolPresetState(d.toolNames !== undefined ? getPresetFromToolNames(d.toolNames) : "default");
@@ -825,7 +837,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const respondToExtensionUi = useCallback(async (
     request: ExtensionUiDialogRequest,
-    response: { value: string } | { confirmed: boolean } | { cancelled: true },
+    response: { value: string } | { values: string[] } | { confirmed: boolean } | { cancelled: true },
   ) => {
     const sid = sessionIdRef.current;
     setExtensionDialog((current) => current?.id === request.id ? null : current);
@@ -873,6 +885,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
     switch (request.method) {
       case "select":
+      case "multi-select":
       case "confirm":
       case "input":
       case "editor":
@@ -1298,6 +1311,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           });
         } else if (completed) {
           setMessages((prev) => [...prev, normalizeToolCalls(completed)]);
+          if (completed.role === "toolResult") {
+            // The persisted result now renders from `messages`, so drop the live
+            // entry instead of accumulating one per finished tool call.
+            const { toolCallId } = completed;
+            setActiveToolResults((prev) => {
+              if (!prev.has(toolCallId)) return prev;
+              const next = new Map(prev);
+              next.delete(toolCallId);
+              return next;
+            });
+          }
         }
         dispatch({ type: "end" });
         setAgentPhase({ kind: "waiting_model" });
@@ -1306,6 +1330,24 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       case "tool_execution_start": {
         const id = event.toolCallId as string;
         const name = event.toolName as string;
+        // Register every tool call, not only the shell tools: MessageView draws
+        // the running badge and elapsed timer from this entry, including tools
+        // that stream no partial output (read/grep/find/ls), whose card would
+        // otherwise sit blank until the finished result lands.
+        setActiveToolResults((prev) => {
+          if (prev.has(id)) return prev;
+          const next = new Map(prev);
+          const entry: LiveToolResult = {
+            role: "toolResult",
+            toolCallId: id,
+            toolName: name,
+            content: [],
+            running: true,
+            startedAt: Date.now(),
+          };
+          next.set(id, entry);
+          return next;
+        });
         setAgentPhase((prev) => {
           const tools = prev?.kind === "running_tools" ? [...prev.tools] : [];
           if (!tools.some((t) => t.id === id)) tools.push({ id, name });
@@ -1318,17 +1360,22 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         const name = event.toolName as string;
         const partialResult = event.partialResult as Partial<ToolResultMessage> | undefined;
         const content = partialResult?.content;
-        if ((name === "bash" || name === "powershell") && Array.isArray(content)) {
+        if (Array.isArray(content)) {
           setActiveToolResults((prev) => {
             const next = new Map(prev);
-            next.set(id, {
+            const entry: LiveToolResult = {
               role: "toolResult",
               toolCallId: id,
               toolName: name,
               content,
               isError: partialResult?.isError,
               details: partialResult?.details,
-            });
+              running: true,
+              // Keep the original start time so the elapsed counter does not
+              // reset on every streamed chunk.
+              startedAt: (prev.get(id) as LiveToolResult | undefined)?.startedAt ?? Date.now(),
+            };
+            next.set(id, entry);
             return next;
           });
         }
@@ -1351,9 +1398,18 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       case "tool_execution_end": {
         const id = event.toolCallId as string;
         setActiveToolResults((prev) => {
-          if (!prev.has(id)) return prev;
+          const current = prev.get(id);
+          if (!current) return prev;
           const next = new Map(prev);
-          next.delete(id);
+          if (current.content.length > 0) {
+            // Hold the streamed body (no longer running) until the persisted
+            // toolResult replaces this entry in ChatWindow's merged map, so the
+            // card does not blank out in the gap before message_end.
+            const ended: LiveToolResult = { ...current, running: false, timestamp: Date.now() };
+            next.set(id, ended);
+          } else {
+            next.delete(id);
+          }
           return next;
         });
         setAgentPhase((prev) => {
@@ -2246,7 +2302,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   return {
     // State
-    data, loading, error, activeLeafId, messages, activeToolResults, entryIds, historyCursor, hasEarlierMessages, streamState,
+    data, loading, error, activeLeafId, messages, activeToolResults, entryIds, outlineEntries, historyCursor, hasEarlierMessages, streamState,
     agentRunning, modelNames, modelList, modelError, modelScopeWarnings, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel,
     retryInfo, contextUsage, systemPrompt, forkingEntryId,
     isCompacting, compactError, compactResult, currentModel, displayModel, modelSwitching, sessionStats, autoCompactionEnabled,

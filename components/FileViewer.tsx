@@ -24,6 +24,7 @@ import { parseFrontmatter } from "@/lib/frontmatter";
 import { markdownPreviewRehypePlugins, markdownPreviewRemarkPlugins, markdownUrlTransform, normalizeDisplayMath } from "@/lib/markdown";
 import { CodeBlock, MermaidBlock } from "./MermaidBlock";
 import { FrontmatterCard } from "./FrontmatterCard";
+import { FullscreenViewer } from "./FullscreenViewer";
 import { parseUnifiedPatch } from "@/lib/patch";
 import type { GitFileDiffResponse } from "@/lib/git-types";
 import { useI18n } from "@/hooks/useI18n";
@@ -1170,6 +1171,7 @@ function TextFileViewer({
   });
   const onStateChangeRef = useRef(onStateChange);
   const [selectedLineRange, setSelectedLineRange] = useState<SelectedLineRange | null>(null);
+  const [fullscreenOpen, setFullscreenOpen] = useState(false);
 
   onStateChangeRef.current = onStateChange;
 
@@ -1495,6 +1497,7 @@ function TextFileViewer({
   }, [displayMode, mentionLineRange, onMentionLines]);
 
   useEffect(() => {
+    if (fullscreenOpen) return;
     if (!scrollRestorePendingRef.current || loading) return;
     if (error && !isDeletedDiff) return;
     if (requestedInitialDisplayMode === "diff" && !gitDiffResolved) return;
@@ -1510,6 +1513,7 @@ function TextFileViewer({
     data?.content,
     displayMode,
     error,
+    fullscreenOpen,
     gitDiffResolved,
     hasGitDiff,
     isDeletedDiff,
@@ -1548,6 +1552,102 @@ function TextFileViewer({
   const metadata = isDeletedDiff
     ? t("files.deleted")
     : `${language} · ${lines.length} lines · ${formatSize(data!.size)}`;
+  // One content tree, two hosts: inline panel and fullscreen viewer. The inline
+  // copy unmounts while fullscreen is open, so heavy content (syntax highlighting,
+  // HTML iframes) is never built twice.
+  const viewerBody = (
+  effectiveDisplayMode === "diff" && hasGitDiff ? (
+    <DiffView patch={gitDiff.patch!} />
+  ) : isHtml && effectiveDisplayMode === "preview" ? (
+    <iframe
+      srcDoc={content}
+      sandbox="allow-scripts"
+      style={{ width: "100%", height: "100%", border: "none", background: "var(--bg)" }}
+       title={t("i18n.htmlPreview")}
+    />
+  ) : isMarkdown && effectiveDisplayMode === "preview" ? (
+    <div
+      className="markdown-body markdown-file-preview"
+      style={{ padding: "24px 32px" }}
+    >
+      {frontmatter?.data && <FrontmatterCard data={frontmatter.data} />}
+      <ReactMarkdown
+        remarkPlugins={markdownPreviewRemarkPlugins}
+        rehypePlugins={markdownPreviewRehypePlugins}
+        urlTransform={onOpenFile ? markdownUrlTransform : undefined}
+        components={{
+          code({ className, children, ...props }) {
+            const lang = className?.replace("language-", "").toLowerCase() ?? "";
+            const raw = String(children);
+            const isBlock = className?.includes("language-") || raw.includes("\n");
+            if (isBlock) {
+              if (lang === "mermaid") {
+                return <MermaidBlock code={raw.replace(/\n$/, "")} defaultPreview />;
+              }
+              return <CodeBlock code={raw.replace(/\n$/, "")} lang={lang} />;
+            }
+            return (
+              <code className={className} {...props}>
+                {children}
+              </code>
+            );
+          },
+          pre({ children }) {
+            // Render the code block directly — CodeBlock provides its own wrapping.
+            // For non-mermaid blocks, pass through to default pre rendering.
+            return <>{children}</>;
+          },
+          a({ href, children, ...props }) {
+            delete props.node;
+            const linkedFile = onOpenFile
+              ? resolveLocalFileHref(href, markdownDirectory, cwd ?? markdownDirectory)
+              : null;
+            if (!linkedFile || !onOpenFile) {
+              return <a href={href} {...props}>{children}</a>;
+            }
+
+            const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
+              if (!shouldOpenLocalFileInApp(event)) return;
+              event.preventDefault();
+              onOpenFile(linkedFile, parsePdfPageFragment(href) ?? undefined);
+            };
+
+            return <a href={href} {...props} onClick={handleClick}>{children}</a>;
+          },
+          img({ src, alt, ...props }) {
+            delete props.node;
+            const imagePath = typeof src === "string"
+              ? resolveLocalFileHref(src, markdownDirectory, cwd ?? markdownDirectory)
+              : null;
+            const imageSrc = imagePath
+              ? getFileApiUrl(imagePath, "read", sourceSessionId)
+              : src;
+            // Dynamic local paths are served directly by the file API.
+            // eslint-disable-next-line @next/next/no-img-element
+            return <img src={imageSrc} alt={alt ?? ""} loading="lazy" {...props} />;
+          },
+        }}
+      >
+        {markdownPreview}
+      </ReactMarkdown>
+    </div>
+  ) : useLightweightSource ? (
+    <div
+      className="file-source-view is-lightweight"
+      style={{
+        width: wrapLines ? "100%" : "max-content",
+        minWidth: "100%",
+        minHeight: "100%",
+        background: "var(--bg)",
+        ...FILE_CODE_STYLE,
+      }}
+    >
+      {lightweightSourceLines}
+    </div>
+  ) : (
+    highlightedSource
+  )
+  );
 
   return (
     <div className="file-viewer-shell" style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden", position: "relative" }}>
@@ -1634,6 +1734,24 @@ function TextFileViewer({
                 <MentionIcon />
               </button>
             )}
+            {!isDeletedDiff && (
+              <button
+                type="button"
+                onClick={() => setFullscreenOpen(true)}
+                title={t("i18n.openFullscreen")}
+                aria-label={t("i18n.openFullscreen")}
+                aria-haspopup="dialog"
+                aria-expanded={fullscreenOpen}
+                className="file-viewer-icon-button"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M8 3H5a2 2 0 0 0-2 2v3" />
+                  <path d="M16 3h3a2 2 0 0 1 2 2v3" />
+                  <path d="M8 21H5a2 2 0 0 1-2-2v-3" />
+                  <path d="M16 21h3a2 2 0 0 0 2-2v-3" />
+                </svg>
+              </button>
+            )}
             {effectiveDisplayMode === "source" && (
               <>
                 <button
@@ -1698,103 +1816,30 @@ function TextFileViewer({
         ref={contentRef}
         className="file-viewer-content"
         onScroll={(event) => {
+          // Ignore the clamp to 0 that happens while fullscreen unmounts this tree.
+          if (fullscreenOpen) return;
           viewerStateRef.current.scrollTop = event.currentTarget.scrollTop;
           viewerStateRef.current.scrollLeft = event.currentTarget.scrollLeft;
         }}
         style={{ flex: 1, overflow: "auto", background: "var(--bg)", paddingBottom: data?.truncated ? 48 : undefined }}
       >
-        {effectiveDisplayMode === "diff" && hasGitDiff ? (
-          <DiffView patch={gitDiff.patch!} />
-        ) : isHtml && effectiveDisplayMode === "preview" ? (
-          <iframe
-            srcDoc={content}
-            sandbox="allow-scripts"
-            style={{ width: "100%", height: "100%", border: "none", background: "var(--bg)" }}
-             title={t("i18n.htmlPreview")}
-          />
-        ) : isMarkdown && effectiveDisplayMode === "preview" ? (
-          <div
-            className="markdown-body markdown-file-preview"
-            style={{ padding: "24px 32px" }}
-          >
-            {frontmatter?.data && <FrontmatterCard data={frontmatter.data} />}
-            <ReactMarkdown
-              remarkPlugins={markdownPreviewRemarkPlugins}
-              rehypePlugins={markdownPreviewRehypePlugins}
-              urlTransform={onOpenFile ? markdownUrlTransform : undefined}
-              components={{
-                code({ className, children, ...props }) {
-                  const lang = className?.replace("language-", "").toLowerCase() ?? "";
-                  const raw = String(children);
-                  const isBlock = className?.includes("language-") || raw.includes("\n");
-                  if (isBlock) {
-                    if (lang === "mermaid") {
-                      return <MermaidBlock code={raw.replace(/\n$/, "")} defaultPreview />;
-                    }
-                    return <CodeBlock code={raw.replace(/\n$/, "")} lang={lang} />;
-                  }
-                  return (
-                    <code className={className} {...props}>
-                      {children}
-                    </code>
-                  );
-                },
-                pre({ children }) {
-                  // Render the code block directly — CodeBlock provides its own wrapping.
-                  // For non-mermaid blocks, pass through to default pre rendering.
-                  return <>{children}</>;
-                },
-                a({ href, children, ...props }) {
-                  delete props.node;
-                  const linkedFile = onOpenFile
-                    ? resolveLocalFileHref(href, markdownDirectory, cwd ?? markdownDirectory)
-                    : null;
-                  if (!linkedFile || !onOpenFile) {
-                    return <a href={href} {...props}>{children}</a>;
-                  }
-
-                  const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
-                    if (!shouldOpenLocalFileInApp(event)) return;
-                    event.preventDefault();
-                    onOpenFile(linkedFile, parsePdfPageFragment(href) ?? undefined);
-                  };
-
-                  return <a href={href} {...props} onClick={handleClick}>{children}</a>;
-                },
-                img({ src, alt, ...props }) {
-                  delete props.node;
-                  const imagePath = typeof src === "string"
-                    ? resolveLocalFileHref(src, markdownDirectory, cwd ?? markdownDirectory)
-                    : null;
-                  const imageSrc = imagePath
-                    ? getFileApiUrl(imagePath, "read", sourceSessionId)
-                    : src;
-                  // Dynamic local paths are served directly by the file API.
-                  // eslint-disable-next-line @next/next/no-img-element
-                  return <img src={imageSrc} alt={alt ?? ""} loading="lazy" {...props} />;
-                },
-              }}
-            >
-              {markdownPreview}
-            </ReactMarkdown>
-          </div>
-        ) : useLightweightSource ? (
-          <div
-            className="file-source-view is-lightweight"
-            style={{
-              width: wrapLines ? "100%" : "max-content",
-              minWidth: "100%",
-              minHeight: "100%",
-              background: "var(--bg)",
-              ...FILE_CODE_STYLE,
-            }}
-          >
-            {lightweightSourceLines}
-          </div>
-        ) : (
-          highlightedSource
-        )}
+        {fullscreenOpen ? null : viewerBody}
       </div>
+
+      {!isDeletedDiff && (
+        <FullscreenViewer
+          isOpen={fullscreenOpen}
+          onClose={() => {
+            scrollRestorePendingRef.current = true;
+            setFullscreenOpen(false);
+          }}
+          title={getRelativeFilePath(filePath, cwd)}
+          titleExtra={<span style={{ fontSize: 11, color: "var(--text-dim)" }}>{metadata}</span>}
+          deferContent
+        >
+          {viewerBody}
+        </FullscreenViewer>
+      )}
     </div>
   );
 }

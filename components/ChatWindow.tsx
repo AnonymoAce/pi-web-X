@@ -13,6 +13,7 @@ import { MessageView } from "./MessageView";
 import { MarkdownBody } from "./MarkdownBody";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ChatMinimap, useMessageRefs } from "./ChatMinimap";
+import { OutlineIndex } from "./OutlineIndex";
 import { ExtensionStatusBar } from "./ExtensionStatusBar";
 import { AnsiText } from "./AnsiText";
 import { useI18n } from "@/hooks/useI18n";
@@ -274,7 +275,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
   const [restoreAnchorReady, setRestoreAnchorReady] = useState(false);
 
   const {
-    loading, error, messages, activeToolResults, entryIds, historyCursor, hasEarlierMessages, streamState,
+    loading, error, messages, activeToolResults, entryIds, outlineEntries, historyCursor, hasEarlierMessages, streamState,
     agentRunning, bashRunning, pendingBash, modelNames, modelList, modelError, modelScopeWarnings, modelThinkingLevels, modelThinkingLevelMaps, toolPreset, thinkingLevel,
     retryInfo, contextUsage, forkingEntryId,
     isCompacting, compactError, compactResult, displayModel: displayModelValue, modelSwitching, sessionStats,
@@ -749,6 +750,62 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
   const revealHistoryForMinimap = useCallback(() => {
     setVisibleCount((current) => Math.max(current, messages.length * 2));
   }, [messages.length]);
+  // Outline rail jump: reuse the existing scrollToMessage channel. A tick older
+  // than the lazily rendered window has no DOM node yet, so widen the render
+  // window (same reveal the minimap uses) and scroll once the node lands. The
+  // rail spans the FULL branch, so a tick outside the loaded page has no message
+  // at all — page older history in through the search-jump channel first.
+  const pendingOutlineEntryRef = useRef<string | null>(null);
+  const handleOutlineScroll = useCallback((entryId: string) => {
+    const element = messageContentRef.current?.querySelector(`[data-entry-id="${CSS.escape(entryId)}"]`);
+    if (element instanceof HTMLElement) {
+      scrollToMessage(element, 24);
+      return;
+    }
+    pendingOutlineEntryRef.current = entryId;
+    const history = searchHistoryRef.current;
+    if (history.entryIds.includes(entryId)) {
+      revealHistoryForMinimap();
+      return;
+    }
+    const sid = session?.id ?? sessionIdRef.current;
+    if (!sid || loadingOlderRef.current) return;
+    loadingOlderRef.current = true;
+    const container = scrollContainerRef.current;
+    if (container) prevScrollDistanceRef.current = captureScrollDistance(container.scrollHeight, container.scrollTop);
+    void (async () => {
+      let before = history.historyCursor;
+      let hasMore = history.hasEarlierMessages;
+      try {
+        // ponytail: page until the anchor lands; 200 entries per page matches the
+        // search jump the user already accepts, deeper misses just stop.
+        while (hasMore && before) {
+          const context = await loadContext(sid, activeLeafId, before, { tail: 200 });
+          if (!context) break;
+          if (context.entryIds.includes(entryId)) {
+            prevScrollDistanceRef.current = null;
+            setVisibleCount((current) => Math.max(current, (searchHistoryRef.current.entryIds.length + 200) * 2));
+            return;
+          }
+          before = context.oldestEntryId;
+          hasMore = context.hasMore;
+        }
+        // Anchor belongs to another branch (fork/navigate): drop the pending jump.
+        pendingOutlineEntryRef.current = null;
+      } finally {
+        loadingOlderRef.current = false;
+      }
+    })();
+  }, [activeLeafId, loadContext, revealHistoryForMinimap, scrollContainerRef, scrollToMessage, session?.id, sessionIdRef]);
+
+  useLayoutEffect(() => {
+    const entryId = pendingOutlineEntryRef.current;
+    if (!entryId) return;
+    const element = messageContentRef.current?.querySelector(`[data-entry-id="${CSS.escape(entryId)}"]`);
+    if (!(element instanceof HTMLElement)) return;
+    pendingOutlineEntryRef.current = null;
+    scrollToMessage(element, 24);
+  }, [entryIds, scrollToMessage, visibleCount]);
 
   const isEmptyNew = isNew && messages.length === 0 && !streamState.isStreaming && !sessionBusy;
   const hasStreamingContent = Boolean(streamState.streamingMessage?.content.length);
@@ -979,12 +1036,6 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
       </div>
 
       <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
-        {extensionDialog && (
-          <ExtensionDialog key={extensionDialog.id} request={extensionDialog} onRespond={respondToExtensionUi} />
-        )}
-        {extensionCustomUi && (
-          <ExtensionCustomPanel key={extensionCustomUi.id} request={extensionCustomUi} onInput={sendExtensionCustomInput} />
-        )}
         {!isEmptyNew && <>
         <div
           ref={scrollContainerRef}
@@ -1221,18 +1272,34 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
               />
             )}
 
+            {extensionDialog && (
+              <ExtensionDialog key={extensionDialog.id} request={extensionDialog} onRespond={respondToExtensionUi} />
+            )}
+            {extensionCustomUi && (
+              <ExtensionCustomPanel key={extensionCustomUi.id} request={extensionCustomUi} onInput={sendExtensionCustomInput} />
+            )}
+
             <div ref={promptAnchorSpacerRef} aria-hidden="true" />
             </div>
           </div>
         </div>
         {isMobile || pendingScrollRestore ? null : (
-          <ChatMinimap
-            messages={messages}
-            streamingMessage={streamState.streamingMessage}
-            scrollContainer={scrollContainerRef}
-            messageRefs={messageRefs}
-            onRevealHistory={revealHistoryForMinimap}
-          />
+          <>
+            <OutlineIndex
+              messages={messages}
+              entryIds={entryIds}
+              sourceEntries={outlineEntries.length > 0 ? outlineEntries : undefined}
+              rightOffset={CHAT_MINIMAP_WIDTH + 4}
+              onScrollToMessageId={handleOutlineScroll}
+            />
+            <ChatMinimap
+              messages={messages}
+              streamingMessage={streamState.streamingMessage}
+              scrollContainer={scrollContainerRef}
+              messageRefs={messageRefs}
+              onRevealHistory={revealHistoryForMinimap}
+            />
+          </>
         )}
         </>}
       </div>
@@ -1471,10 +1538,20 @@ function NoticeShelf({ notices, floating = false, onPauseChange }: { notices: No
   );
 }
 
-type ExtensionDialogRequest = Extract<ExtensionUiRequest, { method: "select" | "confirm" | "input" | "editor" }>;
+// Inline cards sit at the tail of the message flow, so a freshly arrived one has to be
+// revealed; otherwise the request lands below the fold and reads as if nothing happened.
+function useInlineReveal<T extends HTMLElement>() {
+  const ref = useRef<T | null>(null);
+  useLayoutEffect(() => {
+    ref.current?.scrollIntoView({ block: "nearest" });
+  }, []);
+  return ref;
+}
+
+type ExtensionDialogRequest = Extract<ExtensionUiRequest, { method: "select" | "multi-select" | "confirm" | "input" | "editor" }>;
 
 function getExtensionDialogSummary(request: ExtensionDialogRequest): string | undefined {
-  if (request.method === "select" && request.options.length > 0) return request.options[0];
+  if ((request.method === "select" || request.method === "multi-select") && request.options.length > 0) return request.options[0];
   if (request.method === "confirm") {
     const firstLine = request.message.split("\n").find((line) => line.trim());
     return firstLine?.trim();
@@ -1487,10 +1564,13 @@ function ExtensionDialog({
   onRespond,
 }: {
   request: ExtensionDialogRequest;
-  onRespond: (request: ExtensionDialogRequest, response: { value: string } | { confirmed: boolean } | { cancelled: true }) => void;
+  onRespond: (request: ExtensionDialogRequest, response: { value: string } | { values: string[] } | { confirmed: boolean } | { cancelled: true }) => void;
 }) {
   const { t } = useI18n();
   const [value, setValue] = useState(request.method === "editor" ? request.prefill ?? "" : "");
+  const [selectedOptions, setSelectedOptions] = useState<Set<string>>(() => new Set());
+  const [customAnswer, setCustomAnswer] = useState("");
+  const revealRef = useInlineReveal<HTMLDivElement>();
   const [collapsed, setCollapsed] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const focusFirstOption = useCallback((element: HTMLDivElement | null) => element?.focus(), []);
@@ -1512,9 +1592,22 @@ function ExtensionDialog({
     </span>
   );
 
+  const toggleOption = (option: string) => {
+    setSelectedOptions((current) => {
+      const next = new Set(current);
+      if (next.has(option)) next.delete(option);
+      else next.add(option);
+      return next;
+    });
+  };
+
   const submitValue = () => {
     if (request.method === "confirm") {
       onRespond(request, { confirmed: true });
+    } else if (request.method === "multi-select") {
+      const extra = customAnswer.trim();
+      const picked = Array.from(selectedOptions);
+      onRespond(request, { values: extra ? [...picked, extra] : picked });
     } else {
       onRespond(request, { value });
     }
@@ -1522,6 +1615,7 @@ function ExtensionDialog({
 
   return (
     <div
+      ref={revealRef}
       onKeyDown={(event) => {
         if (event.key !== "Escape" || event.nativeEvent.isComposing) return;
         event.preventDefault();
@@ -1529,14 +1623,10 @@ function ExtensionDialog({
         onRespond(request, { cancelled: true });
       }}
       style={{
-        position: "absolute",
-        inset: 0,
-        zIndex: 90,
         display: "flex",
-        alignItems: collapsed ? "flex-start" : "center",
+        alignItems: "flex-start",
         justifyContent: "center",
-        padding: 20,
-        pointerEvents: "none",
+        margin: "12px 0",
       }}
     >
       {collapsed ? (
@@ -1545,17 +1635,16 @@ function ExtensionDialog({
           onClick={() => setCollapsed(false)}
           aria-expanded={false}
           style={{
-            pointerEvents: "auto",
             display: "flex",
             alignItems: "center",
             gap: 10,
-            maxWidth: "min(560px, 100%)",
+            maxWidth: 560,
             width: "100%",
             padding: "10px 12px",
             border: "1px solid var(--border)",
             borderRadius: 8,
             background: "var(--bg)",
-            boxShadow: "0 12px 32px rgba(0,0,0,0.18)",
+            boxShadow: "0 1px 2px rgba(15,23,42,0.06)",
             color: "var(--text)",
             cursor: "pointer",
             textAlign: "left",
@@ -1582,19 +1671,19 @@ function ExtensionDialog({
         role="dialog"
         aria-label={request.title}
         style={{
-          pointerEvents: "auto",
-          width: "min(560px, 100%)",
-          maxHeight: "min(760px, 100%)",
+          width: "100%",
+          maxWidth: 560,
+          maxHeight: "min(640px, 70vh)",
           display: "flex",
           flexDirection: "column",
           border: "1px solid var(--border)",
           borderRadius: 8,
           background: "var(--bg)",
-          boxShadow: "0 20px 60px rgba(0,0,0,0.28)",
+          boxShadow: "0 1px 2px rgba(15,23,42,0.06), 0 8px 24px -12px rgba(15,23,42,0.18)",
           overflow: "hidden",
         }}
       >
-        <div style={{ flexShrink: 0, display: "flex", alignItems: "flex-start", gap: 8, padding: "12px 14px", borderBottom: "1px solid var(--border)", maxHeight: "50%", overflowY: "auto" }}>
+        <div style={{ flexShrink: 0, display: "flex", alignItems: "flex-start", gap: 8, padding: "12px 14px", borderBottom: "1px solid var(--border)", maxHeight: "40vh", overflowY: "auto" }}>
           <div style={{ flex: 1, minWidth: 0 }}>
             {/* Pi's TUI shows the title verbatim, newlines included; select/input have no
                 separate message field, so extensions put multi-line text here. */}
@@ -1692,6 +1781,100 @@ function ExtensionDialog({
               ))}
             </div>
           )}
+          {request.method === "multi-select" && (
+            <div
+              onKeyDown={(event) => {
+                if (!["ArrowDown", "ArrowRight", "ArrowUp", "ArrowLeft", "Home", "End"].includes(event.key)) return;
+                const rows = Array.from(event.currentTarget.querySelectorAll<HTMLElement>("[data-extension-option]"));
+                const index = rows.indexOf(event.target as HTMLElement);
+                if (index < 0) return;
+                event.preventDefault();
+                const next = event.key === "Home" ? 0
+                  : event.key === "End" ? rows.length - 1
+                  : (index + (event.key === "ArrowDown" || event.key === "ArrowRight" ? 1 : -1) + rows.length) % rows.length;
+                rows[next].focus({ preventScroll: true });
+                rows[next].scrollIntoView({ block: "nearest" });
+              }}
+              style={{ display: "grid", gap: 8 }}
+            >
+              {request.options.map((option, index) => {
+                const checked = selectedOptions.has(option);
+                return (
+                  <div
+                    key={option}
+                    role="checkbox"
+                    aria-checked={checked}
+                    aria-label={option}
+                    tabIndex={0}
+                    data-extension-option
+                    ref={index === 0 ? focusFirstOption : undefined}
+                    onClick={() => toggleOption(option)}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter" && event.key !== " ") return;
+                      event.preventDefault();
+                      toggleOption(option);
+                    }}
+                    style={{
+                      display: "flex",
+                      alignItems: "flex-start",
+                      gap: 9,
+                      width: "100%",
+                      padding: "9px 10px",
+                      borderRadius: 7,
+                      border: `1px solid ${checked ? "var(--accent)" : "var(--border)"}`,
+                      background: "var(--bg-panel)",
+                      color: "var(--text)",
+                      cursor: "pointer",
+                      fontSize: 13,
+                      overflowWrap: "anywhere",
+                      scrollMargin: 14,
+                    }}
+                  >
+                    <span
+                      aria-hidden="true"
+                      style={{
+                        flexShrink: 0,
+                        display: "grid",
+                        placeItems: "center",
+                        width: 15,
+                        height: 15,
+                        marginTop: 1,
+                        borderRadius: 4,
+                        border: `1px solid ${checked ? "var(--accent)" : "var(--border)"}`,
+                        background: checked ? "var(--accent)" : "transparent",
+                        color: "var(--accent-contrast)",
+                        fontSize: 11,
+                        lineHeight: 1,
+                      }}
+                    >
+                      {checked ? "✓" : ""}
+                    </span>
+                    <div inert style={{ minWidth: 0 }}>
+                      <MarkdownBody>{option}</MarkdownBody>
+                    </div>
+                  </div>
+                );
+              })}
+              <input
+                value={customAnswer}
+                placeholder={t("chat.extensionOtherPlaceholder")}
+                onChange={(e) => setCustomAnswer(e.target.value)}
+                onKeyDown={(e) => {
+                  if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && !e.nativeEvent.isComposing) submitValue();
+                }}
+                style={{
+                  width: "100%",
+                  padding: "9px 10px",
+                  borderRadius: 7,
+                  border: "1px solid var(--border)",
+                  background: "var(--bg-panel)",
+                  color: "var(--text)",
+                  outline: "none",
+                  fontSize: 13,
+                }}
+              />
+            </div>
+          )}
           {request.method === "input" && (
             <input
               autoFocus
@@ -1768,7 +1951,7 @@ function ExtensionDialog({
             >
                {t("chat.confirm")}
             </button>
-          ) : request.method !== "select" ? (
+          ) : request.method !== "select" && request.method !== "multi-select" ? (
             <button
               onClick={submitValue}
               style={{
@@ -1803,6 +1986,7 @@ function ExtensionCustomPanel({
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const composingRef = useRef(false);
   const [collapsed, setCollapsed] = useState(false);
+  const revealRef = useInlineReveal<HTMLDivElement>();
   const displayLines = normalizeCustomPanelLines(request.lines);
   const summary = displayLines.find((line) => line.trim())?.trim();
 
@@ -1812,15 +1996,12 @@ function ExtensionCustomPanel({
 
   return (
     <div
+      ref={revealRef}
       style={{
-        position: "absolute",
-        inset: 0,
-        zIndex: 95,
         display: "flex",
-        alignItems: collapsed ? "flex-start" : "center",
+        alignItems: "flex-start",
         justifyContent: "center",
-        padding: 20,
-        pointerEvents: "none",
+        margin: "12px 0",
       }}
     >
       {collapsed ? (
@@ -1829,17 +2010,16 @@ function ExtensionCustomPanel({
           onClick={() => setCollapsed(false)}
           aria-expanded={false}
           style={{
-            pointerEvents: "auto",
             display: "flex",
             alignItems: "center",
             gap: 10,
-            maxWidth: "min(920px, 100%)",
+            maxWidth: 920,
             width: "100%",
             padding: "10px 12px",
             border: "1px solid var(--border)",
             borderRadius: 8,
             background: "var(--bg)",
-            boxShadow: "0 12px 32px rgba(0,0,0,0.18)",
+            boxShadow: "0 1px 2px rgba(15,23,42,0.06)",
             color: "var(--text)",
             cursor: "pointer",
             textAlign: "left",
@@ -1867,10 +2047,10 @@ function ExtensionCustomPanel({
           if (!(event.target as HTMLElement).closest("button")) inputRef.current?.focus();
         }}
         style={{
-          pointerEvents: "auto",
           position: "relative",
-          width: "min(920px, 100%)",
-          maxHeight: "min(760px, 100%)",
+          width: "100%",
+          maxWidth: 920,
+          maxHeight: "min(640px, 70vh)",
           display: "flex",
           flexDirection: "column",
           border: "1px solid var(--border)",

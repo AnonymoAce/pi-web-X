@@ -10,16 +10,35 @@
  */
 const expandedToolCalls = new Set<string>();
 
+/**
+ * Cards the user has collapsed by hand. Kept apart from `expandedToolCalls`
+ * because absence there means "no decision yet", which a card that opens itself
+ * (a running sub-agent) needs to distinguish from "the user closed this".
+ * Without it a remount would re-open a card the user just collapsed.
+ */
+const collapsedToolCalls = new Set<string>();
+
 export function isToolCallExpanded(toolCallId: string | undefined): boolean {
   return toolCallId !== undefined && expandedToolCalls.has(toolCallId);
 }
 
+/** True once the user has collapsed this card, so it stays closed. */
+export function isToolCallCollapsedByUser(toolCallId: string | undefined): boolean {
+  return toolCallId !== undefined && collapsedToolCalls.has(toolCallId);
+}
+
 export function setToolCallExpanded(toolCallId: string | undefined, expanded: boolean): void {
   if (!toolCallId) return;
-  if (expanded) expandedToolCalls.add(toolCallId);
-  else expandedToolCalls.delete(toolCallId);
+  if (expanded) {
+    expandedToolCalls.add(toolCallId);
+    collapsedToolCalls.delete(toolCallId);
+  } else {
+    expandedToolCalls.delete(toolCallId);
+    collapsedToolCalls.add(toolCallId);
+  }
 }
 
 export function clearExpandedToolCalls(): void {
   expandedToolCalls.clear();
+  collapsedToolCalls.clear();
 }

@@ -17,6 +17,7 @@ const {
   replaceUserMessageText,
 } = await jiti.import("./MessageView.tsx");
 const { I18nProvider } = await jiti.import("@/hooks/useI18n");
+const { clearExpandedToolCalls, setToolCallExpanded } = await jiti.import("@/lib/tool-call-expansion");
 const { splitFinalAssistantBlocks } = await jiti.import("@/lib/message-display");
 
 function renderMessage(message, props = {}) {
@@ -351,6 +352,64 @@ test("renders custom-message images as buttons that open a larger preview", () =
   assert.match(html, /<img[^>]+src="data:image\/png;base64,YWJj"/);
 });
 
+test("renders a running tool card with its badge, elapsed time and live output", () => {
+  const block = {
+    type: "toolCall",
+    toolCallId: "call-live-1",
+    toolName: "bash",
+    input: { command: "npm run build" },
+  };
+  const startedAt = Date.now() - 12_000;
+  const html = renderMessage({
+    role: "assistant",
+    provider: "anthropic",
+    model: "claude-test",
+    content: [block],
+  }, {
+    toolResults: new Map([[block.toolCallId, {
+      role: "toolResult",
+      toolCallId: block.toolCallId,
+      toolName: "bash",
+      content: [{ type: "text", text: "compiling chunk 3 of 9" }],
+      running: true,
+      startedAt,
+    }]]),
+  });
+
+  assert.match(html, /Running/);
+  assert.match(html, /compiling chunk 3 of 9/);
+  assert.match(html, /1[012]s/);
+  assert.doesNotMatch(html, /rgba\(34,197,94,0\.25\)/);
+});
+
+test("keeps a running tool without streamed output to a single header row", () => {
+  const block = {
+    type: "toolCall",
+    toolCallId: "call-live-2",
+    toolName: "grep",
+    input: { pattern: "activeToolResults" },
+  };
+  const html = renderMessage({
+    role: "assistant",
+    provider: "anthropic",
+    model: "claude-test",
+    content: [block],
+  }, {
+    toolResults: new Map([[block.toolCallId, {
+      role: "toolResult",
+      toolCallId: block.toolCallId,
+      toolName: "grep",
+      content: [],
+      running: true,
+      startedAt: Date.now(),
+    }]]),
+  });
+
+  assert.match(html, /Running/);
+  assert.match(html, /grep/);
+  assert.doesNotMatch(html, /<pre/);
+});
+
 test("shows tool-result images while the tool details stay collapsed", () => {
   const block = {
     type: "toolCall",
@@ -377,4 +436,73 @@ test("shows tool-result images while the tool details stay collapsed", () => {
   assert.match(html, /<img[^>]+src="data:image\/png;base64,YWJj"/);
   assert.doesNotMatch(html, /captured-1280x720/);
   assert.doesNotMatch(html, /"tabId"/);
+});
+
+const TODO_VIEW_TEXT = [
+  "### 阶段二：对标 OpenCodeUI 第二批 (status: active, 1/2 done)",
+  "  1. [ ] 任务②：Todo 工具卡片·步骤1：新建 todo 提取层与 TodoToolCard",
+  "  2. [/] 任务④：接线 Todo 卡片·步骤1：把 TodoToolCard 接进 MessageView 工具分支",
+].join("\n");
+
+test("renders a todo result as the card and not as raw result text", () => {
+  clearExpandedToolCalls();
+  const block = {
+    type: "toolCall",
+    toolCallId: "call-todo-view-1",
+    toolName: "todo",
+    input: { op: "view" },
+  };
+  const html = renderMessage({
+    role: "assistant",
+    provider: "anthropic",
+    model: "claude-test",
+    content: [block],
+  }, {
+    toolResults: new Map([[block.toolCallId, {
+      role: "toolResult",
+      toolCallId: block.toolCallId,
+      toolName: "todo",
+      content: [{ type: "text", text: TODO_VIEW_TEXT }],
+    }]]),
+  });
+
+  assert.match(html, /data-todo-item/);
+  assert.match(html, /data-todo-progress/);
+  assert.match(html, /1\/2 已完成/);
+  // The card owns this text; printing the item twice means the generic result
+  // pane rendered the very list the card already shows.
+  assert.equal((html.match(/新建 todo 提取层与 TodoToolCard/g) ?? []).length, 1);
+  assert.doesNotMatch(html, /\(status: active/);
+});
+
+test("leaves a todo acknowledgement on the ordinary result path", () => {
+  clearExpandedToolCalls();
+  const block = {
+    type: "toolCall",
+    toolCallId: "call-todo-ack-1",
+    toolName: "todo",
+    input: { op: "add", content: "接线 Todo 卡片" },
+  };
+  setToolCallExpanded(block.toolCallId, true);
+  try {
+    const html = renderMessage({
+      role: "assistant",
+      provider: "anthropic",
+      model: "claude-test",
+      content: [block],
+    }, {
+      toolResults: new Map([[block.toolCallId, {
+        role: "toolResult",
+        toolCallId: block.toolCallId,
+        toolName: "todo",
+        content: [{ type: "text", text: "✓ Added to \"阶段二\". Use todo start when you begin it." }],
+      }]]),
+    });
+
+    assert.doesNotMatch(html, /data-todo-card/);
+    assert.doesNotMatch(html, /data-todo-item/);
+    assert.match(html, /Added to/);
+  } finally {
+    clearExpandedToolCalls();
+  }
 });

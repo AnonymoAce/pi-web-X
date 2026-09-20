@@ -127,6 +127,15 @@ export type ExtensionUiRequest =
   | {
       type: "extension_ui_request";
       id: string;
+      method: "multi-select";
+      title: string;
+      options: string[];
+      timeout?: number;
+      expiresAt?: number;
+    }
+  | {
+      type: "extension_ui_request";
+      id: string;
       method: "confirm";
       title: string;
       message: string;
@@ -195,11 +204,12 @@ export type ExtensionUiRequest =
 
 export type BlockingExtensionUiRequest = Extract<
   ExtensionUiRequest,
-  { method: "select" | "confirm" | "input" | "editor" | "custom" }
+  { method: "select" | "multi-select" | "confirm" | "input" | "editor" | "custom" }
 >;
 
 export type ExtensionUiResponse =
   | { type: "extension_ui_response"; id: string; value: string }
+  | { type: "extension_ui_response"; id: string; values: string[] }
   | { type: "extension_ui_response"; id: string; confirmed: boolean }
   | { type: "extension_ui_response"; id: string; cancelled: true };
 
